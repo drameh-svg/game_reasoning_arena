@@ -61,6 +61,10 @@ password field. The key is used only in the running Python process as the
 selected provider's API-key environment variable; it is not written to result
 logs.
 
+Note: Cursor API keys are shown in the live viewer for clarity, but they are
+not playable model keys for this per-turn game loop. Cursor's public API is
+for Cursor Cloud Agent/admin operations, not chat-completions responses.
+
 ## Architecture
 
 ```

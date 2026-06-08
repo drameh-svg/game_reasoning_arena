@@ -49,12 +49,26 @@ MODEL_PRESETS = {
         "model": "openrouter_google/gemini-2.5-flash",
         "env_var": "OPENROUTER_API_KEY",
     },
+    "Cursor API key (not a playable chat model)": {
+        "model": "cursor-api",
+        "env_var": "CURSOR_API_KEY",
+        "unsupported_reason": (
+            "Cursor API keys are for Cursor Cloud Agent/admin endpoints, "
+            "not a chat-completions model endpoint. This live game needs a "
+            "provider that can answer one prompt per move, such as OpenRouter "
+            "or Groq."
+        ),
+    },
 }
 
 
-def _resolve_preset(model_preset: str) -> Tuple[str, str]:
+def _resolve_preset(model_preset: str) -> Tuple[str, str, str]:
     preset = MODEL_PRESETS.get(model_preset) or MODEL_PRESETS[DEFAULT_PRESET]
-    return preset["model"], preset["env_var"]
+    return (
+        preset["model"],
+        preset["env_var"],
+        preset.get("unsupported_reason", ""),
+    )
 
 
 def _build_config(seed: int, model_name: str) -> Dict[str, Any]:
@@ -135,7 +149,17 @@ def run_live_match(
     seed = int(seed)
     max_turns = int(max_turns)
     delay_seconds = float(delay_seconds)
-    model_name, api_key_env_var = _resolve_preset(model_preset)
+    model_name, api_key_env_var, unsupported_reason = _resolve_preset(
+        model_preset
+    )
+
+    if unsupported_reason:
+        yield (
+            "No board yet.",
+            f"{model_preset} cannot run this match.\n\n{unsupported_reason}",
+            "Status: unsupported provider",
+        )
+        return
 
     load_dotenv()
     api_key = (api_key or "").strip()
