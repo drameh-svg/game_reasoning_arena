@@ -14,8 +14,16 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-import ray
-from dotenv import load_dotenv
+try:
+    import ray
+except ImportError:
+    ray = None
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 from simulate import simulate_game
 from game_reasoning_arena.arena.utils.cleanup import full_cleanup
@@ -53,6 +61,9 @@ def initialize_ray(config=None):
     Args:
         config: Optional configuration dictionary containing Ray settings
     """
+    if ray is None:
+        raise ImportError("Ray is not installed. Install ray or set use_ray=false.")
+
     if not ray.is_initialized():
         ray_config = config.get("ray_config", {}) if config else {}
 
@@ -79,17 +90,20 @@ def initialize_ray(config=None):
         logger.info("Ray initialized with config: %s", init_params)
 
 
-@ray.remote
-def simulate_game_ray(
-    game_name: str,
-    config: Dict[str, Any],
-    seed: int
-) -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Ray remote wrapper for parallel game simulation.
-    Calls the standard simulate_game function.
-    """
-    return simulate_game(game_name, config, seed)
+if ray is not None:
+    @ray.remote
+    def simulate_game_ray(
+        game_name: str,
+        config: Dict[str, Any],
+        seed: int
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Ray remote wrapper for parallel game simulation.
+        Calls the standard simulate_game function.
+        """
+        return simulate_game(game_name, config, seed)
+else:
+    simulate_game_ray = None
 
 
 def create_episode_tasks(

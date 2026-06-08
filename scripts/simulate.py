@@ -12,13 +12,11 @@ from pathlib import Path
 from typing import Dict, Any
 from game_reasoning_arena.arena.utils.seeding import set_seed
 from game_reasoning_arena.arena.games.registry import registry  # Gamesregistry
-from game_reasoning_arena.backends import initialize_llm_registry
 from game_reasoning_arena.arena.agents.policy_manager import (
     initialize_policies, policy_mapping_fn
 )
 from game_reasoning_arena.arena.utils.loggers import SQLiteLogger
 from game_reasoning_arena.arena.agents.llm_agent import LLMEndpointError
-from torch.utils.tensorboard import SummaryWriter
 
 # Ensure the src directory is in the Python path
 current_dir = Path(__file__).parent
@@ -27,6 +25,14 @@ sys.path.insert(0, str(src_dir.resolve()))
 
 
 logger = logging.getLogger(__name__)
+
+
+def config_has_llm_agent(config: Dict[str, Any]) -> bool:
+    """Return True when any configured player uses an LLM-backed agent."""
+    return any(
+        agent.get("type", "").lower() == "llm"
+        for agent in config.get("agents", {}).values()
+    )
 
 
 def log_llm_action(agent_id: int,
@@ -110,8 +116,10 @@ def simulate_game(game_name: str, config: Dict[str, Any], seed: int) -> str:
     # Set global seed for reproducibility across all random number generators
     set_seed(seed)
 
-    # Initialize LLM registry
-    initialize_llm_registry()
+    # Initialize LLM registry only for experiments that use LLM agents.
+    if config_has_llm_agent(config):
+        from game_reasoning_arena.backends import initialize_llm_registry
+        initialize_llm_registry()
 
     # Initialize loggers for all agents
     logger.info("Initializing environment for %s.", game_name)
@@ -138,6 +146,7 @@ def simulate_game(game_name: str, config: Dict[str, Any], seed: int) -> str:
     # Initialize Tensorboard writer only if logging is enabled
     writer = None
     if config.get("tensorboard_logging", False):
+        from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(log_dir=f"runs/{game_name}")
         logger.info(
             "Tensorboard logging enabled - writing to runs/%s", game_name
