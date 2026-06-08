@@ -49,6 +49,10 @@ MODEL_PRESETS = {
         "model": "openrouter_google/gemini-2.5-flash",
         "env_var": "OPENROUTER_API_KEY",
     },
+    "Google Gemini: Gemini 2.5 Flash": {
+        "model": "litellm_gemini/gemini-2.5-flash",
+        "env_var": "GEMINI_API_KEY",
+    },
     "Cursor API key (not a playable chat model)": {
         "model": "cursor-api",
         "env_var": "CURSOR_API_KEY",

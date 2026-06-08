@@ -57,9 +57,10 @@ python3 -m pip install open-spiel litellm gradio python-dotenv
 ```
 
 Choose a model preset, then paste the matching provider API key into the
-password field. The key is used only in the running Python process as the
-selected provider's API-key environment variable; it is not written to result
-logs.
+password field. OpenRouter Gemini presets use an OpenRouter key; Google Gemini
+presets use a Google Gemini/AI Studio key. The key is used only in the running
+Python process as the selected provider's API-key environment variable; it is
+not written to result logs.
 
 Note: Cursor API keys are shown in the live viewer for clarity, but they are
 not playable model keys for this per-turn game loop. Cursor's public API is
