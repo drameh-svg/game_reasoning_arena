@@ -44,7 +44,7 @@ From the project root directory:
 python app.py
 ```
 
-For the lightweight live Connect Four GPT-4o-mini vs Random match viewer:
+For the lightweight live Connect Four LLM vs Random match viewer:
 
 ```bash
 python3 live_connect_four_app.py
@@ -56,9 +56,10 @@ The live viewer requires:
 python3 -m pip install open-spiel litellm gradio python-dotenv
 ```
 
-Paste your OpenAI API key into the password field in the page. The key is
-used only in the running Python process as `OPENAI_API_KEY`; it is not written
-to result logs.
+Choose a model preset, then paste the matching provider API key into the
+password field. The key is used only in the running Python process as the
+selected provider's API-key environment variable; it is not written to result
+logs.
 
 ## Architecture
 

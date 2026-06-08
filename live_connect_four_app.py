@@ -5,8 +5,8 @@ Run from the repository root:
 
     python3 live_connect_four_app.py
 
-Then open the printed local URL, paste an OpenAI API key, and click
-"Run GPT-4o-mini vs Random".
+Then open the printed local URL, choose a provider/model preset, paste the
+matching API key, and click "Run selected model vs Random".
 """
 
 from __future__ import annotations
@@ -30,8 +30,31 @@ except ImportError:
         return False
 
 
-DEFAULT_MODEL = "litellm_gpt-4o-mini"
+DEFAULT_PRESET = "OpenAI: GPT-4o-mini"
 GAME_NAME = "connect_four"
+MODEL_PRESETS = {
+    "OpenAI: GPT-4o-mini": {
+        "model": "litellm_gpt-4o-mini",
+        "env_var": "OPENAI_API_KEY",
+    },
+    "Groq: Llama 3.1 8B Instant": {
+        "model": "litellm_groq/llama-3.1-8b-instant",
+        "env_var": "GROQ_API_KEY",
+    },
+    "OpenRouter: Claude 3.5 Sonnet": {
+        "model": "openrouter_anthropic/claude-3.5-sonnet",
+        "env_var": "OPENROUTER_API_KEY",
+    },
+    "OpenRouter: Gemini 2.5 Flash": {
+        "model": "openrouter_google/gemini-2.5-flash",
+        "env_var": "OPENROUTER_API_KEY",
+    },
+}
+
+
+def _resolve_preset(model_preset: str) -> Tuple[str, str]:
+    preset = MODEL_PRESETS.get(model_preset) or MODEL_PRESETS[DEFAULT_PRESET]
+    return preset["model"], preset["env_var"]
 
 
 def _build_config(seed: int, model_name: str) -> Dict[str, Any]:
@@ -104,7 +127,7 @@ def _format_status(turn: int, rewards: Dict[int, float], done: bool) -> str:
 def run_live_match(
     api_key: str,
     seed: int,
-    model_name: str,
+    model_preset: str,
     delay_seconds: float,
     max_turns: int,
 ) -> Generator[Tuple[str, str, str], None, None]:
@@ -112,17 +135,18 @@ def run_live_match(
     seed = int(seed)
     max_turns = int(max_turns)
     delay_seconds = float(delay_seconds)
-    model_name = (model_name or DEFAULT_MODEL).strip()
+    model_name, api_key_env_var = _resolve_preset(model_preset)
 
     load_dotenv()
     api_key = (api_key or "").strip()
     if api_key:
-        os.environ["OPENAI_API_KEY"] = api_key
+        os.environ[api_key_env_var] = api_key
 
-    if not os.getenv("OPENAI_API_KEY"):
+    if not os.getenv(api_key_env_var):
         yield (
             "No board yet.",
-            "Missing OpenAI API key. Paste it in the password box or set OPENAI_API_KEY.",
+            f"Missing API key for {model_preset}. Paste it in the password "
+            f"box or set {api_key_env_var}.",
             "Status: not started",
         )
         return
@@ -148,8 +172,9 @@ def run_live_match(
 
     config = _build_config(seed=seed, model_name=model_name)
     transcript: List[str] = [
-        "# Live Connect Four: GPT-4o-mini vs Random",
+        "# Live Connect Four: LLM vs Random",
         "",
+        f"- Preset: {model_preset}",
         f"- Player 0: LLM `{model_name}`",
         "- Player 1: repo RandomAgent",
         f"- Seed: {seed}",
@@ -305,21 +330,24 @@ def build_app() -> Any:
 
     with gr.Blocks(title="Live Connect Four LLM Match") as demo:
         gr.Markdown(
-            "# Live Connect Four: GPT-4o-mini vs Random\n"
-            "Paste your OpenAI API key locally, click the button, and watch "
-            "the match stream turn by turn. The key is placed in this Python "
-            "process as `OPENAI_API_KEY`; it is not written to result logs."
+            "# Live Connect Four: LLM vs Random\n"
+            "Choose a provider/model preset, paste that provider's API key "
+            "locally, click the button, and watch the match stream turn by "
+            "turn. The key is placed in this Python process as the selected "
+            "provider's API-key environment variable; it is not written to "
+            "result logs."
         )
 
         with gr.Row():
             api_key = gr.Textbox(
-                label="OpenAI API key",
+                label="Provider API key",
                 type="password",
-                placeholder="sk-...",
+                placeholder="OpenAI, Groq, or OpenRouter key",
             )
-            model_name = gr.Textbox(
-                label="Model",
-                value=DEFAULT_MODEL,
+            model_preset = gr.Dropdown(
+                label="Model preset",
+                choices=list(MODEL_PRESETS.keys()),
+                value=DEFAULT_PRESET,
             )
 
         with gr.Row():
@@ -333,7 +361,7 @@ def build_app() -> Any:
             )
             max_turns = gr.Number(label="Max turns", value=42, precision=0)
 
-        run_button = gr.Button("Run GPT-4o-mini vs Random", variant="primary")
+        run_button = gr.Button("Run selected model vs Random", variant="primary")
 
         with gr.Row():
             board = gr.Markdown(label="Board")
@@ -343,7 +371,7 @@ def build_app() -> Any:
 
         run_button.click(
             fn=run_live_match,
-            inputs=[api_key, seed, model_name, delay_seconds, max_turns],
+            inputs=[api_key, seed, model_preset, delay_seconds, max_turns],
             outputs=[board, transcript, status],
         )
 
