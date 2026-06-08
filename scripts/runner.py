@@ -365,12 +365,15 @@ def main():
         print("Running simulation...")
         run_simulation(config)
 
-        print("Running post-game processing...")
-        current_dir = Path(__file__).parent
-        script_path = (
-            current_dir / ".." / "analysis" / "post_game_processing.py"
-        )
-        subprocess.run(["python3", str(script_path)], check=True)
+        if config.get("run_post_processing", True):
+            print("Running post-game processing...")
+            current_dir = Path(__file__).parent
+            script_path = (
+                current_dir / ".." / "analysis" / "post_game_processing.py"
+            )
+            subprocess.run(["python3", str(script_path)], check=True)
+        else:
+            print("Skipping post-game processing.")
 
         print("Simulation completed.")
 
