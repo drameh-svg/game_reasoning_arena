@@ -10,6 +10,12 @@ import logging
 import sys
 from pathlib import Path
 from typing import Dict, Any
+
+# Ensure the src directory is in the Python path before package imports.
+current_dir = Path(__file__).parent
+src_dir = current_dir / ".." / "src"
+sys.path.insert(0, str(src_dir.resolve()))
+
 from game_reasoning_arena.arena.utils.seeding import set_seed
 from game_reasoning_arena.arena.games.registry import registry  # Gamesregistry
 from game_reasoning_arena.arena.agents.policy_manager import (
@@ -17,11 +23,6 @@ from game_reasoning_arena.arena.agents.policy_manager import (
 )
 from game_reasoning_arena.arena.utils.loggers import SQLiteLogger
 from game_reasoning_arena.arena.agents.llm_agent import LLMEndpointError
-
-# Ensure the src directory is in the Python path
-current_dir = Path(__file__).parent
-src_dir = current_dir / ".." / "src"
-sys.path.insert(0, str(src_dir.resolve()))
 
 
 logger = logging.getLogger(__name__)
