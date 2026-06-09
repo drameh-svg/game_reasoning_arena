@@ -98,6 +98,130 @@ MODEL_PRESETS = {
     },
 }
 
+# Custom CSS keeps the frontend readable for research sessions without adding a
+# separate JavaScript/React application. The class names are attached to Gradio
+# components below via `elem_classes`.
+APP_CSS = """
+:root {
+  --ark-bg: #0f172a;
+  --ark-panel: #111827;
+  --ark-panel-soft: #1f2937;
+  --ark-card: #ffffff;
+  --ark-text: #0f172a;
+  --ark-muted: #64748b;
+  --ark-blue: #2563eb;
+  --ark-cyan: #06b6d4;
+  --ark-green: #16a34a;
+  --ark-yellow: #ca8a04;
+  --ark-red: #dc2626;
+  --ark-border: #dbe3ef;
+}
+
+.ark-page {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+  background:
+    radial-gradient(circle at top left, rgba(37, 99, 235, 0.16), transparent 32rem),
+    linear-gradient(135deg, #f8fbff 0%, #eef4ff 48%, #f8fafc 100%);
+}
+
+.ark-hero {
+  padding: 1.25rem 1.5rem;
+  border-radius: 22px;
+  color: white;
+  background: linear-gradient(135deg, #0f172a 0%, #1d4ed8 58%, #0891b2 100%);
+  box-shadow: 0 18px 45px rgba(15, 23, 42, 0.24);
+}
+
+.ark-hero h1 {
+  margin-bottom: 0.2rem;
+  letter-spacing: -0.035em;
+}
+
+.ark-sidebar {
+  min-width: 260px;
+  padding: 1rem;
+  border: 1px solid var(--ark-border);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.88);
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+}
+
+.setup-modal {
+  padding: 1rem;
+  border: 1px solid rgba(37, 99, 235, 0.22);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.18);
+}
+
+.setup-modal::before {
+  content: "Run setup";
+  display: inline-block;
+  margin-bottom: 0.75rem;
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  color: #1d4ed8;
+  background: #dbeafe;
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.board-card, .status-card, .log-card {
+  padding: 1rem;
+  border: 1px solid var(--ark-border);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+}
+
+.board-card pre {
+  font-family: "SFMono-Regular", "Cascadia Code", "Roboto Mono", Menlo, monospace;
+  font-size: 0.95rem;
+  line-height: 1.35;
+  color: #e5f0ff;
+  background: #0b1220;
+  border-radius: 14px;
+  padding: 1rem;
+}
+
+.log-card {
+  max-height: 620px;
+  overflow-y: auto;
+}
+
+.status-card {
+  font-size: 0.95rem;
+}
+
+.status-pill {
+  display: inline-block;
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  color: white;
+  font-weight: 800;
+}
+
+.status-running { background: var(--ark-blue); }
+.status-finished { background: var(--ark-green); }
+.outcome-win { color: var(--ark-green); font-weight: 800; }
+.outcome-loss { color: var(--ark-red); font-weight: 800; }
+.outcome-draw { color: var(--ark-yellow); font-weight: 800; }
+
+.primary-run button {
+  min-height: 3rem;
+  border-radius: 14px !important;
+  font-weight: 800 !important;
+  letter-spacing: 0.01em;
+}
+
+.secondary-action button {
+  border-radius: 12px !important;
+}
+"""
+
 
 def _resolve_preset(model_preset: str) -> Tuple[str, str, str]:
     """Map a UI model label to backend model name, API env var, and caveat.
@@ -207,6 +331,75 @@ def _write_export_bundle(
     return str(zip_path)
 
 
+def _list_previous_game_sets(limit: int = 12) -> str:
+    """Return Markdown for the sidebar list of saved game-set exports.
+
+    The sidebar reads ZIP files created by `_write_export_bundle`. It does not
+    parse or mutate them; it simply gives users a lightweight audit trail of
+    recent saved runs.
+    """
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    zip_files = sorted(
+        EXPORT_DIR.glob("*.zip"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not zip_files:
+        return (
+            "### Previous game sets\n"
+            "No saved exports yet. Run a game set with **Save/export game data** "
+            "enabled."
+        )
+
+    lines = ["### Previous game sets"]
+    for path in zip_files[:limit]:
+        modified = datetime.fromtimestamp(path.stat().st_mtime).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        size_kb = path.stat().st_size / 1024
+        lines.append(f"- `{path.name}`  \n  {modified} UTC-ish, {size_kb:.1f} KB")
+
+    if len(zip_files) > limit:
+        lines.append(f"\n_Showing latest {limit} of {len(zip_files)} exports._")
+
+    return "\n".join(lines)
+
+
+def _prepare_setup_panel_for_run(
+    api_key: str,
+    game_set_name: str,
+    model_preset: str,
+) -> Any:
+    """Hide setup only when the basic required run inputs are present.
+
+    This keeps the modal-style setup card visible for correctable validation
+    errors such as missing game set name or missing API key. The full run still
+    performs its own validation in `run_live_match`; this helper only controls
+    the UI transition.
+    """
+    import gradio as gr
+
+    _, api_key_env_var, unsupported_reason = _resolve_preset(model_preset)
+    if unsupported_reason:
+        return gr.update(visible=True)
+    if not (game_set_name or "").strip():
+        return gr.update(visible=True)
+
+    load_dotenv()
+    pasted_key = (api_key or "").strip()
+    if not pasted_key and not os.getenv(api_key_env_var):
+        return gr.update(visible=True)
+
+    return gr.update(visible=False)
+
+
+def _show_setup_panel() -> Any:
+    """Show the setup panel so users can configure another named game set."""
+    import gradio as gr
+
+    return gr.update(visible=True)
+
+
 def _build_config(
     game_name: str,
     seed: int,
@@ -304,15 +497,19 @@ def _format_status(
     done: bool,
     summary_counts: Dict[str, int],
 ) -> str:
-    """Create the small status panel shown beside the live board."""
+    """Create the color-coded status panel shown beside the live board."""
     status = "finished" if done else "running"
+    status_class = "status-finished" if done else "status-running"
     return (
-        f"Status: {status}\n"
-        f"Round: {round_number}/{total_rounds}\n"
-        f"Turn: {turn}\n"
-        f"Rewards: Player 0 = {rewards.get(0, 0)}, "
-        f"Player 1 = {rewards.get(1, 'n/a')}\n"
-        f"Player 0 outcomes: {summary_counts}"
+        f"<span class='status-pill {status_class}'>● {status.upper()}</span>\n\n"
+        f"**Round:** {round_number}/{total_rounds}  \n"
+        f"**Turn:** {turn}  \n"
+        f"**Rewards:** Player 0 = `{rewards.get(0, 0)}`, "
+        f"Player 1 = `{rewards.get(1, 'n/a')}`  \n\n"
+        "**Player 0 outcomes**  \n"
+        f"<span class='outcome-win'>Wins: {summary_counts.get('win', 0)}</span> · "
+        f"<span class='outcome-loss'>Losses: {summary_counts.get('loss', 0)}</span> · "
+        f"<span class='outcome-draw'>Draws: {summary_counts.get('draw', 0)}</span>"
     )
 
 
@@ -836,84 +1033,140 @@ def build_app() -> Any:
 
     # `Blocks` is Gradio's simple layout API. It avoids a custom JavaScript
     # frontend while still giving us dropdowns, live streaming, and downloads.
-    with gr.Blocks(title="Arkadium Testing Arena") as demo:
+    with gr.Blocks(
+        title="Arkadium Testing Arena",
+        elem_classes=["ark-page"],
+    ) as demo:
+        # Inject CSS inside the document instead of relying on constructor
+        # parameters that differ across Gradio versions.
+        gr.HTML(f"<style>{APP_CSS}</style>")
+
         # Header text defines the expected privacy boundary for API keys and
         # reminds users that keys are not included in research artifacts.
         gr.Markdown(
             "# Arkadium Testing Arena\n"
-            "Name a set of games, choose a game and provider/model preset, "
-            "paste that provider's API key locally, choose how many rounds "
-            "to run, and watch the match stream turn by turn. The key is "
-            "placed in this Python process as the selected provider's "
-            "API-key environment variable; it is not written to result logs."
+            "Transparent multi-game LLM evaluation for game-based reasoning "
+            "research. Name a set of games, configure the run, then watch the "
+            "board, model reasoning, outcomes, and export artifact update live.",
+            elem_classes=["ark-hero"],
         )
 
-        # This name groups multiple rounds into one named research run. It is
-        # required by `run_live_match` and becomes part of export filenames and
-        # JSON/CSV metadata.
-        game_set_name = gr.Textbox(
-            label="Game set name",
-            placeholder="Example: connect4_gemini_10_rounds_trial_1",
+        with gr.Row():
+            # Sidebar: persistent run-management area. It remains visible while
+            # the setup panel hides, so users can find prior saved game sets.
+            with gr.Column(scale=1, min_width=260, elem_classes=["ark-sidebar"]):
+                previous_sets = gr.Markdown(value=_list_previous_game_sets())
+                refresh_sets = gr.Button(
+                    "Refresh saved sets",
+                    elem_classes=["secondary-action"],
+                )
+                new_game_set = gr.Button(
+                    "New game set",
+                    elem_classes=["secondary-action"],
+                )
+
+            with gr.Column(scale=4):
+                # Modal-style setup panel. It is visible on load and hidden as
+                # soon as a run starts, approximating a modal flow while staying
+                # compatible with Gradio's Python-only UI model.
+                with gr.Column(visible=True, elem_classes=["setup-modal"]) as setup_panel:
+                    # This name groups multiple rounds into one named research
+                    # run. It becomes part of export filenames and metadata.
+                    game_set_name = gr.Textbox(
+                        label="Game set name",
+                        placeholder="Example: connect4_gemini_10_rounds_trial_1",
+                    )
+
+                    # Provider/model and game choices are dropdowns to reduce
+                    # typo-driven failures and make the condition explicit.
+                    with gr.Row():
+                        api_key = gr.Textbox(
+                            label="Provider API key",
+                            type="password",
+                            placeholder="OpenAI, Groq, OpenRouter, or Google Gemini key",
+                        )
+                        model_preset = gr.Dropdown(
+                            label="Model preset",
+                            choices=list(MODEL_PRESETS.keys()),
+                            value=DEFAULT_PRESET,
+                        )
+                        game_preset = gr.Dropdown(
+                            label="Game",
+                            choices=list(GAME_PRESETS.keys()),
+                            value="Connect Four",
+                        )
+
+                    # Reproducibility and runtime controls. Rounds are separate
+                    # OpenSpiel episodes; max turns is a safety cutoff.
+                    with gr.Row():
+                        seed = gr.Number(label="Seed", value=42, precision=0)
+                        rounds = gr.Number(label="Rounds", value=1, precision=0)
+                        save_game_data = gr.Checkbox(
+                            label="Save/export game data",
+                            value=True,
+                        )
+                        max_turns = gr.Number(
+                            label="Max turns per round",
+                            value=80,
+                            precision=0,
+                        )
+
+                    delay_seconds = gr.Slider(
+                        label="Delay between turns",
+                        minimum=0.0,
+                        maximum=5.0,
+                        value=0.5,
+                        step=0.25,
+                    )
+
+                    run_button = gr.Button(
+                        "Run selected model vs Random",
+                        variant="primary",
+                        elem_classes=["primary-run"],
+                    )
+
+                # Live outputs are segmented into distinct cards so board state,
+                # run status, and logs are visually separate.
+                with gr.Row():
+                    board = gr.Markdown(
+                        value="### Board\nConfigure a game set and click **Run**.",
+                        label="Board",
+                        elem_classes=["board-card"],
+                    )
+                    status = gr.Markdown(
+                        value="<span class='status-pill status-running'>● READY</span>",
+                        label="Status",
+                        elem_classes=["status-card"],
+                    )
+
+                transcript = gr.Markdown(
+                    value=(
+                        "### Round log and reasoning trace\n"
+                        "The setup panel will disappear when a run starts. "
+                        "Click **New game set** in the sidebar to configure "
+                        "another run."
+                    ),
+                    label="Turn log and reasoning trace",
+                    elem_classes=["log-card"],
+                )
+
+                # This remains empty until `run_live_match` writes an export ZIP
+                # at the end of a saved run.
+                export_file = gr.File(label="Download game set export")
+
+        # Sidebar actions are intentionally independent of the run button.
+        refresh_sets.click(fn=_list_previous_game_sets, outputs=previous_sets)
+        new_game_set.click(fn=_show_setup_panel, outputs=setup_panel)
+
+        # First decide whether the setup panel should stay visible or disappear,
+        # then run the streaming generator, then refresh the saved-set sidebar
+        # after the generator completes.
+        run_event = run_button.click(
+            fn=_prepare_setup_panel_for_run,
+            inputs=[api_key, game_set_name, model_preset],
+            outputs=setup_panel,
         )
-
-        # First input row: provider key, model choice, and game choice. The
-        # dropdowns prevent typos in provider/model/game identifiers.
-        with gr.Row():
-            api_key = gr.Textbox(
-                label="Provider API key",
-                type="password",
-                placeholder="OpenAI, Groq, OpenRouter, or Google Gemini key",
-            )
-            model_preset = gr.Dropdown(
-                label="Model preset",
-                choices=list(MODEL_PRESETS.keys()),
-                value=DEFAULT_PRESET,
-            )
-            game_preset = gr.Dropdown(
-                label="Game",
-                choices=list(GAME_PRESETS.keys()),
-                value="Connect Four",
-            )
-
-        # Second input row: reproducibility and runtime controls. Rounds are
-        # separate OpenSpiel episodes; max turns is a safety cutoff per episode.
-        with gr.Row():
-            seed = gr.Number(label="Seed", value=42, precision=0)
-            rounds = gr.Number(label="Rounds", value=1, precision=0)
-            # Default to saving because this project is about producing
-            # auditable research artifacts, not only watching the live UI.
-            save_game_data = gr.Checkbox(
-                label="Save/export game data",
-                value=True,
-            )
-            delay_seconds = gr.Slider(
-                label="Delay between turns",
-                minimum=0.0,
-                maximum=5.0,
-                value=0.5,
-                step=0.25,
-            )
-            max_turns = gr.Number(label="Max turns per round", value=80, precision=0)
-
-        # The button starts the generator. As the generator yields, Gradio
-        # updates the board, transcript, status, and eventually the ZIP file.
-        run_button = gr.Button("Run selected model vs Random", variant="primary")
-
-        # Live outputs. Board and transcript are Markdown so fixed-width game
-        # states and reasoning text stay readable.
-        with gr.Row():
-            board = gr.Markdown(label="Board")
-            status = gr.Textbox(label="Status", lines=4)
-
-        transcript = gr.Markdown(label="Turn log and reasoning trace")
-        # This remains empty until `run_live_match` writes an export ZIP at the
-        # end of a saved run.
-        export_file = gr.File(label="Download game set export")
-
-        # The input order here must exactly match the `run_live_match`
-        # signature, and every yield from that function must match this output
-        # order.
-        run_button.click(
+        run_event.then(
             fn=run_live_match,
             inputs=[
                 api_key,
@@ -927,7 +1180,7 @@ def build_app() -> Any:
                 max_turns,
             ],
             outputs=[board, transcript, status, export_file],
-        )
+        ).then(fn=_list_previous_game_sets, outputs=previous_sets)
 
     return demo
 
