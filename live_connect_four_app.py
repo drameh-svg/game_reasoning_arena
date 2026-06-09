@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Lightweight Gradio app for live LLM-vs-random game matches.
+"""Arkadium Testing Arena local frontend.
+
+This file is intentionally written as a transparent, single-file experiment
+runner. It is more verbose than a production web app because the project is a
+research workflow: reviewers should be able to inspect how games, models,
+rounds, logs, and exports are created without chasing hidden framework magic.
 
 Run from the repository root:
 
@@ -11,6 +16,9 @@ paste the matching API key, and click "Run selected model vs Random".
 
 from __future__ import annotations
 
+# Standard-library modules only. Keeping these imports explicit makes it clear
+# which parts of the app touch files (`csv`, `json`, `zipfile`, `Path`), process
+# environment variables (`os`), or time/metadata (`datetime`, `time`).
 import csv
 import json
 import os
@@ -23,12 +31,17 @@ from pathlib import Path
 from typing import Any, Dict, Generator, List, Tuple
 
 
+# Resolve paths relative to this file so the app works when launched from the
+# repository root in VS Code. `SRC_DIR` is inserted into `sys.path` because the
+# package is not always installed with `pip install -e .` on student machines.
 ROOT_DIR = Path(__file__).resolve().parent
 SRC_DIR = ROOT_DIR / "src"
 EXPORT_DIR = ROOT_DIR / "results" / "live_exports"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+# `.env` support is optional. If python-dotenv is not installed, the app still
+# runs; users can paste keys into the UI or set environment variables manually.
 try:
     from dotenv import load_dotenv
 except ImportError:
@@ -36,6 +49,14 @@ except ImportError:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Frontend presets
+# ---------------------------------------------------------------------------
+#
+# These dictionaries are the source of truth for what appears in the Gradio
+# dropdowns. Display labels are intentionally human-readable; values map to the
+# internal OpenSpiel game names and LiteLLM/OpenRouter model identifiers used by
+# the repository.
 DEFAULT_PRESET = "OpenAI: GPT-4o-mini"
 DEFAULT_GAME = "connect_four"
 GAME_PRESETS = {
@@ -79,6 +100,15 @@ MODEL_PRESETS = {
 
 
 def _resolve_preset(model_preset: str) -> Tuple[str, str, str]:
+    """Map a UI model label to backend model name, API env var, and caveat.
+
+    Returns:
+        model_name: The string consumed by the existing LLM backend registry.
+        env_var: The provider-specific environment variable expected by the
+            backend (`OPENAI_API_KEY`, `GEMINI_API_KEY`, etc.).
+        unsupported_reason: Non-empty when the dropdown option exists only to
+            explain why it cannot be used as a playable model.
+    """
     preset = MODEL_PRESETS.get(model_preset) or MODEL_PRESETS[DEFAULT_PRESET]
     return (
         preset["model"],
@@ -88,6 +118,12 @@ def _resolve_preset(model_preset: str) -> Tuple[str, str, str]:
 
 
 def _sanitize_name(value: str) -> str:
+    """Convert a user-provided game set name into a safe file stem.
+
+    The raw game set name remains in the JSON/CSV metadata. This sanitized
+    version is only used for filenames so spaces, slashes, and punctuation do
+    not create invalid paths.
+    """
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
     return cleaned.strip("._-") or "unnamed_game_set"
 
@@ -99,7 +135,21 @@ def _write_export_bundle(
     round_records: List[Dict[str, Any]],
     transcript: List[str],
 ) -> str:
+    """Write a complete downloadable export for one named game set.
+
+    The export intentionally contains both JSON and CSV:
+    - JSON preserves nested metadata, round summaries, transcript text, and
+      full turn records without flattening.
+    - CSV gives researchers a spreadsheet-friendly turn-level table.
+
+    Returns:
+        Absolute path to the ZIP file that Gradio exposes through `gr.File`.
+    """
+    # Ensure the export directory exists before writing files. The directory is
+    # under `results/` so generated artifacts stay with the rest of the run data.
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Add UTC time to avoid overwriting repeated runs with the same set name.
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     safe_name = _sanitize_name(game_set_name)
     base_path = EXPORT_DIR / f"{safe_name}_{timestamp}"
@@ -113,9 +163,13 @@ def _write_export_bundle(
         "turns": turn_records,
         "transcript": transcript,
     }
+    # The JSON file is the highest-fidelity artifact. `ensure_ascii=False`
+    # preserves card glyphs from OpenSpiel games like Solitaire.
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
+    # CSV columns are fixed so downstream scripts can rely on a stable schema.
+    # Values not present in a record are written as empty strings.
     fieldnames = [
         "game_set_name",
         "game",
@@ -145,6 +199,7 @@ def _write_export_bundle(
         for record in turn_records:
             writer.writerow({field: record.get(field, "") for field in fieldnames})
 
+    # Bundle both files so the browser exposes a single download per game set.
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.write(json_path, arcname=json_path.name)
         zf.write(csv_path, arcname=csv_path.name)
@@ -158,6 +213,12 @@ def _build_config(
     model_name: str,
     num_players: int,
 ) -> Dict[str, Any]:
+    """Build the same kind of config dictionary used by `scripts/runner.py`.
+
+    Player 0 is always the model under evaluation. For two-player OpenSpiel
+    games, player 1 is the repo's `RandomAgent`. For single-player games like
+    OpenSpiel Solitaire, only player 0 is configured.
+    """
     agents = {
         "player_0": {
             "type": "llm",
@@ -190,6 +251,11 @@ def _build_config(
 
 
 def _agent_metadata(config: Dict[str, Any], player_id: int) -> Tuple[str, str]:
+    """Return normalized type/model metadata for logs and exports.
+
+    Non-LLM agents deliberately report model `None`; this prevents leftover
+    model defaults from being attached to random-agent output.
+    """
     agent_config = config["agents"].get(f"player_{player_id}", {})
     agent_type = agent_config.get("type", "unknown")
     model_name = agent_config.get("model", "None") if agent_type == "llm" else "None"
@@ -197,6 +263,7 @@ def _agent_metadata(config: Dict[str, Any], player_id: int) -> Tuple[str, str]:
 
 
 def _opponent_label(config: Dict[str, Any], player_id: int) -> str:
+    """Build a compact opponent label for SQLite result rows."""
     labels = []
     for key, agent_config in config["agents"].items():
         if key == f"player_{player_id}":
@@ -208,16 +275,24 @@ def _opponent_label(config: Dict[str, Any], player_id: int) -> str:
 
 
 def _extract_action_and_reasoning(response: Any) -> Tuple[int, str]:
+    """Normalize agent return values into `(action, reasoning)`.
+
+    The repo agents generally return `{"action": int, "reasoning": str}`.
+    This fallback also accepts a raw action for compatibility with simpler
+    agents.
+    """
     if isinstance(response, dict):
         return response.get("action", -1), response.get("reasoning", "None")
     return response, "None"
 
 
 def _resolve_game(game_preset: str) -> str:
+    """Map the UI game label to the internal OpenSpiel registry name."""
     return GAME_PRESETS.get(game_preset) or DEFAULT_GAME
 
 
 def _render_board(env: Any, player_id: int = 0) -> str:
+    """Render the current environment state as a Markdown code block."""
     return f"```text\n{env.render_board(player_id)}\n```"
 
 
@@ -229,6 +304,7 @@ def _format_status(
     done: bool,
     summary_counts: Dict[str, int],
 ) -> str:
+    """Create the small status panel shown beside the live board."""
     status = "finished" if done else "running"
     return (
         f"Status: {status}\n"
@@ -246,6 +322,12 @@ def _classify_player_outcome(
     num_players: int,
     truncated: bool,
 ) -> str:
+    """Classify one player's round outcome from OpenSpiel rewards.
+
+    This deliberately simple reward-based classifier is documented because it
+    is part of the research method. Future Arkadium-specific game adapters can
+    replace it with richer game-specific success criteria.
+    """
     if truncated:
         return "loss"
 
@@ -275,7 +357,17 @@ def run_live_match(
     delay_seconds: float,
     max_turns: int,
 ) -> Generator[Tuple[str, str, str, Any], None, None]:
-    """Run one or more game rounds and stream board/log/status updates."""
+    """Run one or more game rounds and stream board/log/status updates.
+
+    Gradio supports streaming by consuming yielded tuples from this generator.
+    Every `yield` returns the same four outputs in order:
+    1. board Markdown
+    2. transcript Markdown
+    3. status textbox text
+    4. optional export ZIP path for the download component
+    """
+    # A named game set is required because the export filename and metadata use
+    # this value to group multiple rounds into a single research unit.
     game_set_name = (game_set_name or "").strip()
     if not game_set_name:
         yield (
@@ -286,15 +378,21 @@ def run_live_match(
         )
         return
 
+    # Gradio numeric widgets can pass numbers as floats; cast them before using
+    # them as seeds, loop bounds, or max-turn cutoffs.
     seed = int(seed)
     rounds = max(1, int(rounds))
     max_turns = int(max_turns)
     delay_seconds = float(delay_seconds)
+
+    # Convert UI dropdown labels into internal game/model identifiers.
     game_name = _resolve_game(game_preset)
     model_name, api_key_env_var, unsupported_reason = _resolve_preset(
         model_preset
     )
 
+    # Some dropdown choices are intentionally explanatory rather than playable.
+    # Cursor API keys fall into this category.
     if unsupported_reason:
         yield (
             "No board yet.",
@@ -304,11 +402,16 @@ def run_live_match(
         )
         return
 
+    # Load `.env` first, then let a pasted key override the environment for this
+    # Python process. The key is never written to SQLite, JSON, CSV, or logs by
+    # this app.
     load_dotenv()
     api_key = (api_key or "").strip()
     if api_key:
         os.environ[api_key_env_var] = api_key
 
+    # Stop before importing/running provider code when the selected provider key
+    # is absent. This gives users a clear UI error instead of a backend stack.
     if not os.getenv(api_key_env_var):
         yield (
             "No board yet.",
@@ -319,6 +422,8 @@ def run_live_match(
         )
         return
 
+    # Import heavy repo components lazily so opening the UI does not require the
+    # whole experiment stack until a run actually starts.
     try:
         from game_reasoning_arena.arena.agents.policy_manager import (
             initialize_policies,
@@ -339,6 +444,8 @@ def run_live_match(
         )
         return
 
+    # Ask OpenSpiel how many players the selected game has. This determines
+    # whether we configure player 1 as RandomAgent or run a single-player task.
     try:
         num_players = registry.get_game_loader(game_name)().num_players()
     except Exception as exc:
@@ -350,6 +457,8 @@ def run_live_match(
         )
         return
 
+    # Build one config object for the selected game/model. The config is reused
+    # across rounds, while the seed changes per round for reproducibility.
     config = _build_config(
         game_name=game_name,
         seed=seed,
@@ -369,6 +478,8 @@ def run_live_match(
         "",
     ]
 
+    # Initialize global seeding and model registry once per game set. Actual
+    # agent instances and environments are recreated each round below.
     try:
         set_seed(seed)
         initialize_llm_registry()
@@ -382,12 +493,16 @@ def run_live_match(
         )
         return
 
+    # Create one SQLite logger per player. The existing repository logger writes
+    # to `results/<agent_type>_<model>.db`.
     loggers = {}
     for player_id in range(num_players):
         agent_type, agent_model = _agent_metadata(config, player_id)
         sanitized_model = agent_model.replace("-", "_").replace("/", "_")
         loggers[player_id] = SQLiteLogger(agent_type, sanitized_model)
 
+    # These in-memory structures feed the live transcript and downloadable
+    # JSON/CSV export. SQLite logging still happens independently.
     summary_counts = {"win": 0, "loss": 0, "draw": 0}
     round_summaries: List[str] = []
     round_records: List[Dict[str, Any]] = []
@@ -408,9 +523,14 @@ def run_live_match(
         "started_at_utc": datetime.utcnow().isoformat(),
     }
 
+    # Main experiment loop: one iteration equals one complete game episode.
     for round_index in range(rounds):
         round_number = round_index + 1
         round_seed = seed + round_index
+
+        # Recreate policies and environment each round so episodes are isolated.
+        # The deterministic seed progression lets researchers rerun the same
+        # named set with the same seeds.
         try:
             set_seed(round_seed)
             policies = initialize_policies(config, game_name, round_seed)
@@ -432,10 +552,14 @@ def run_live_match(
             )
             return
 
+        # Rewards are tracked separately from OpenSpiel step rewards so the UI
+        # can display the latest known reward values at every yield.
         rewards = {player_id: 0.0 for player_id in range(num_players)}
         terminated = truncated = False
         turn = 0
 
+        # Yield the starting state before any model call. This makes the browser
+        # visibly update as soon as a round begins.
         transcript.append(f"\n# Round {round_number}/{rounds}")
         transcript.append(f"Seed: `{round_seed}`")
         transcript.append("Initial board:")
@@ -449,22 +573,32 @@ def run_live_match(
             export_path,
         )
 
+        # Inner turn loop: ask the active player for one action, validate it,
+        # apply it to OpenSpiel, stream the update, and repeat.
         while not (terminated or truncated):
+            # A max-turn cutoff protects research runs from hanging on games
+            # with very long or pathological trajectories.
             if turn >= max_turns:
                 truncated = True
                 transcript.append(f"\nStopped after max_turns={max_turns}.")
                 break
 
+            # This framework currently handles turn-based OpenSpiel games. The
+            # active player is the only player with an observation/action here.
             current_player = env.state.current_player()
             observation = observations[current_player]
             legal_actions = observation["legal_actions"]
             agent = player_to_agent[current_player]
+
+            # Capture pre-action state for export before the environment mutates.
             state_before = observation.get("state_string", "")
             board_before = env.render_board(0)
 
             transcript.append(f"\n## Round {round_number}, Turn {turn}: Player {current_player}")
             transcript.append(f"Legal actions: `{legal_actions}`")
 
+            # Agent invocation is the only place where a model API call happens
+            # for LLM players. RandomAgent returns immediately without API use.
             try:
                 response = agent(observation)
                 action, reasoning = _extract_action_and_reasoning(response)
@@ -481,12 +615,17 @@ def run_live_match(
                 )
                 return
 
+            # Add the action and reasoning trace to the live transcript before
+            # applying the move, so failed/illegal choices remain visible.
             agent_type, agent_model = _agent_metadata(config, current_player)
             transcript.append(f"Chosen action: `{action}`")
             if agent_type == "llm":
                 transcript.append("Reasoning trace:")
                 transcript.append(f"> {reasoning}")
 
+            # Illegal moves are logged and treated as terminal failures for the
+            # run. This is one of the failure categories the project wants to
+            # measure explicitly.
             if action not in legal_actions:
                 loggers[current_player].log_illegal_move(
                     game_name=game_name,
@@ -506,6 +645,8 @@ def run_live_match(
                 )
                 return
 
+            # Persist the move through the repository's existing SQLite schema.
+            # The richer JSON/CSV export is built separately below.
             loggers[current_player].log_move(
                 game_name=game_name,
                 episode=round_number,
@@ -520,14 +661,22 @@ def run_live_match(
                 board_state=observation["state_string"],
             )
 
+            # Apply the action to OpenSpiel. The environment returns next
+            # observations, current rewards, and termination/truncation flags.
             observations, step_rewards, terminated, truncated, _ = env.step(
                 {current_player: action}
             )
             rewards.update(step_rewards)
+
+            # Capture post-action state for export. Terminal states do not have
+            # a next active-player observation, so `state_after` is blank there.
             state_after = "" if terminated or truncated else observations[
                 env.state.current_player()
             ].get("state_string", "")
             board_after = env.render_board(0)
+
+            # Store a full turn record for the downloadable export. The outcome
+            # fields are filled in after the round ends and rewards are final.
             turn_records.append({
                 "game_set_name": game_set_name,
                 "game": game_name,
@@ -554,6 +703,7 @@ def run_live_match(
             turn += 1
             last_board = _render_board(env)
 
+            # Stream the latest board/transcript/status back to Gradio.
             yield (
                 last_board,
                 "\n".join(transcript),
@@ -571,6 +721,8 @@ def run_live_match(
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
 
+        # Once the round exits, classify the model player's result and record a
+        # compact round summary for both the UI and the export.
         final_status = "truncated" if truncated else "terminated"
         player0_outcome = _classify_player_outcome(
             rewards, player_id=0, num_players=num_players, truncated=truncated
@@ -592,12 +744,17 @@ def run_live_match(
             "rewards": rewards.copy(),
             "turns": turn,
         })
+
+        # Attach round-level outcome/status to each turn from this round. This
+        # makes per-turn CSV analysis possible without joining separate tables.
         for record in turn_records:
             if record["round"] == round_number:
                 record["outcome"] = player0_outcome
                 record["round_status"] = final_status
         transcript.append(f"\n## {round_summary}")
 
+        # Persist final rewards/results to SQLite for every player. The status
+        # suffix (`_win`, `_loss`, `_draw`) makes round outcomes queryable.
         for player_id, reward in rewards.items():
             player_outcome = _classify_player_outcome(
                 rewards,
@@ -614,6 +771,7 @@ def run_live_match(
                 opponent=_opponent_label(config, player_id),
             )
 
+        # Stream the end-of-round summary before starting the next round.
         transcript.append("\nRound summaries so far:")
         transcript.extend(f"- {summary}" for summary in round_summaries)
         yield (
@@ -625,6 +783,8 @@ def run_live_match(
             export_path,
         )
 
+    # After all requested rounds finish, optionally produce the downloadable
+    # research artifact bundle.
     transcript.append("\n# Final summary")
     transcript.append(f"Player 0 outcomes: `{summary_counts}`")
     if save_game_data:
@@ -641,6 +801,7 @@ def run_live_match(
     else:
         transcript.append("Export saving was disabled for this run.")
 
+    # Final yield exposes the ZIP path to Gradio's file download component.
     yield (
         last_board,
         "\n".join(transcript),
@@ -657,6 +818,14 @@ def run_live_match(
 
 
 def build_app() -> Any:
+    """Construct the Gradio interface for the local research app.
+
+    The UI code is kept thin on purpose: widgets collect parameters, and the
+    `run_live_match` generator above performs the experiment. This separation
+    makes the research control flow easier to audit.
+    """
+    # Import Gradio lazily so this module can still be imported for tests or
+    # export helpers in environments that have not installed UI dependencies.
     try:
         import gradio as gr
     except ImportError as exc:
@@ -665,7 +834,11 @@ def build_app() -> Any:
             "python3 -m pip install gradio"
         ) from exc
 
+    # `Blocks` is Gradio's simple layout API. It avoids a custom JavaScript
+    # frontend while still giving us dropdowns, live streaming, and downloads.
     with gr.Blocks(title="Arkadium Testing Arena") as demo:
+        # Header text defines the expected privacy boundary for API keys and
+        # reminds users that keys are not included in research artifacts.
         gr.Markdown(
             "# Arkadium Testing Arena\n"
             "Name a set of games, choose a game and provider/model preset, "
@@ -675,11 +848,16 @@ def build_app() -> Any:
             "API-key environment variable; it is not written to result logs."
         )
 
+        # This name groups multiple rounds into one named research run. It is
+        # required by `run_live_match` and becomes part of export filenames and
+        # JSON/CSV metadata.
         game_set_name = gr.Textbox(
             label="Game set name",
             placeholder="Example: connect4_gemini_10_rounds_trial_1",
         )
 
+        # First input row: provider key, model choice, and game choice. The
+        # dropdowns prevent typos in provider/model/game identifiers.
         with gr.Row():
             api_key = gr.Textbox(
                 label="Provider API key",
@@ -697,9 +875,13 @@ def build_app() -> Any:
                 value="Connect Four",
             )
 
+        # Second input row: reproducibility and runtime controls. Rounds are
+        # separate OpenSpiel episodes; max turns is a safety cutoff per episode.
         with gr.Row():
             seed = gr.Number(label="Seed", value=42, precision=0)
             rounds = gr.Number(label="Rounds", value=1, precision=0)
+            # Default to saving because this project is about producing
+            # auditable research artifacts, not only watching the live UI.
             save_game_data = gr.Checkbox(
                 label="Save/export game data",
                 value=True,
@@ -713,15 +895,24 @@ def build_app() -> Any:
             )
             max_turns = gr.Number(label="Max turns per round", value=80, precision=0)
 
+        # The button starts the generator. As the generator yields, Gradio
+        # updates the board, transcript, status, and eventually the ZIP file.
         run_button = gr.Button("Run selected model vs Random", variant="primary")
 
+        # Live outputs. Board and transcript are Markdown so fixed-width game
+        # states and reasoning text stay readable.
         with gr.Row():
             board = gr.Markdown(label="Board")
             status = gr.Textbox(label="Status", lines=4)
 
         transcript = gr.Markdown(label="Turn log and reasoning trace")
+        # This remains empty until `run_live_match` writes an export ZIP at the
+        # end of a saved run.
         export_file = gr.File(label="Download game set export")
 
+        # The input order here must exactly match the `run_live_match`
+        # signature, and every yield from that function must match this output
+        # order.
         run_button.click(
             fn=run_live_match,
             inputs=[
@@ -742,5 +933,7 @@ def build_app() -> Any:
 
 
 if __name__ == "__main__":
+    # Bind to all interfaces for compatibility with local VS Code, Codespaces,
+    # and cloud/remote development. Users should open the URL Gradio prints.
     app = build_app()
     app.launch(server_name="0.0.0.0", server_port=7860)
