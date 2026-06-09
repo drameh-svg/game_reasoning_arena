@@ -1004,19 +1004,39 @@ def run_experiment_live(
                 observation = observations[player_id]
                 legal_actions = observation["legal_actions"]
                 agent_type, agent_model = _agent_metadata(config, player_id)
-                if agent_type == "strong_bot":
-                    action, reasoning = _strong_bot_action(
-                        game_name,
-                        env.state,
-                        player_id,
-                        legal_actions,
+                try:
+                    if agent_type == "strong_bot":
+                        action, reasoning = _strong_bot_action(
+                            game_name,
+                            env.state,
+                            player_id,
+                            legal_actions,
+                        )
+                    elif agent_type == "openspiel_bot":
+                        action = player_to_agent[player_id].step(env.state)
+                        reasoning = "OpenSpiel uniform random bot selected the action."
+                    else:
+                        response = player_to_agent[player_id](observation)
+                        action, reasoning = _extract_action_and_reasoning(response)
+                except Exception as exc:
+                    error_message = (
+                        f"Action generation failed in episode {episode}, "
+                        f"turn {turn}, player {player_id} "
+                        f"({agent_type}/{agent_model}): "
+                        f"{type(exc).__name__}: {exc}"
                     )
-                elif agent_type == "openspiel_bot":
-                    action = player_to_agent[player_id].step(env.state)
-                    reasoning = "OpenSpiel uniform random bot selected the action."
-                else:
-                    response = player_to_agent[player_id](observation)
-                    action, reasoning = _extract_action_and_reasoning(response)
+                    transcript.append(f"\n## Error\n{error_message}")
+                    yield (
+                        last_board,
+                        "\n".join(transcript),
+                        f"Status: action generation error\n{error_message}",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    return
 
                 transcript.append(
                     f"\nEpisode {episode}, Turn {turn}, Player {player_id}"
@@ -1077,7 +1097,25 @@ def run_experiment_live(
             if truncated:
                 break
 
-            observations, step_rewards, terminated, truncated, _ = env.step(action_dict)
+            try:
+                observations, step_rewards, terminated, truncated, _ = env.step(action_dict)
+            except Exception as exc:
+                error_message = (
+                    f"OpenSpiel step failed in episode {episode}, turn {turn}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                transcript.append(f"\n## Error\n{error_message}")
+                yield (
+                    last_board,
+                    "\n".join(transcript),
+                    f"Status: environment step error\n{error_message}",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                return
             rewards.update(step_rewards)
             turn += 1
             last_board = _render_board(env, 0)
