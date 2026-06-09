@@ -1,0 +1,874 @@
+#!/usr/bin/env python3
+"""Minimal frontend for the original Game Reasoning Arena workflow.
+
+This frontend deliberately follows the methodology of the upstream
+Game Reasoning Arena repository:
+
+- games come from the OpenSpiel-backed registry
+- agents come from the repository policy manager
+- model names use the existing backend prefixes (`litellm_`, `openrouter_`,
+  `hf_`, `vllm_`)
+- moves, reasoning traces, rewards, illegal moves, and game results are written
+  through `SQLiteLogger`
+- CSV/JSON exports are derived from the same per-move/per-result fields used by
+  the repository's logging and analysis workflow
+
+Run from the repository root:
+
+    python3 game_reasoning_arena_frontend.py
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Generator, List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Repository path setup
+# ---------------------------------------------------------------------------
+#
+# The original README assumes users run scripts from the repository root after
+# `pip install -e .`. In student/local VS Code environments that editable
+# install is easy to miss, so the frontend adds `src/` to Python's import path.
+ROOT_DIR = Path(__file__).resolve().parent
+SRC_DIR = ROOT_DIR / "src"
+EXPORT_DIR = ROOT_DIR / "results" / "frontend_exports"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# UI choices that mirror the upstream README/model naming conventions
+# ---------------------------------------------------------------------------
+
+GAME_CHOICES = {
+    "Tic-Tac-Toe": "tic_tac_toe",
+    "Connect Four": "connect_four",
+    "Kuhn Poker": "kuhn_poker",
+    "Matrix Prisoner's Dilemma": "matrix_pd",
+    "Matching Pennies": "matching_pennies",
+    "Matrix Rock-Paper-Scissors": "matrix_rps",
+    "Hex": "hex",
+}
+
+MODEL_CHOICES = {
+    # Remote/API models.
+    "Remote / OpenAI GPT-4o-mini": {
+        "model": "litellm_gpt-4o-mini",
+        "env_var": "OPENAI_API_KEY",
+    },
+    "Remote / Groq Llama 3.1 8B Instant": {
+        "model": "litellm_groq/llama-3.1-8b-instant",
+        "env_var": "GROQ_API_KEY",
+    },
+    "Remote / OpenRouter Claude 3.5 Sonnet": {
+        "model": "openrouter_anthropic/claude-3.5-sonnet",
+        "env_var": "OPENROUTER_API_KEY",
+    },
+    "Remote / OpenRouter Gemini 2.5 Flash": {
+        "model": "openrouter_google/gemini-2.5-flash",
+        "env_var": "OPENROUTER_API_KEY",
+    },
+    "Remote / OpenRouter Grok 4": {
+        "model": "openrouter_x-ai/grok-4",
+        "env_var": "OPENROUTER_API_KEY",
+    },
+    "Remote / Google Gemini 2.5 Flash": {
+        "model": "litellm_gemini/gemini-2.5-flash",
+        "env_var": "GEMINI_API_KEY",
+    },
+    # Local models. These do not need hosted API keys, but they do need local
+    # runtime dependencies/models.
+    "Local / HuggingFace distilgpt2": {
+        "model": "hf_distilgpt2",
+        "env_var": "",
+    },
+    "Local / HuggingFace FLAN-T5 Small": {
+        "model": "hf_google/flan-t5-small",
+        "env_var": "",
+    },
+    "Local / vLLM Qwen2-7B-Instruct": {
+        "model": "vllm_Qwen2-7B-Instruct",
+        "env_var": "",
+    },
+}
+
+AGENT_TYPES = ["llm", "random"]
+
+APP_CSS = """
+body, .gradio-container {
+  background: #ffffff !important;
+  color: #111111 !important;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif !important;
+}
+.gra-hero {
+  border: 1px solid #111111;
+  padding: 1.25rem 1.5rem;
+  background: #ffffff;
+}
+.gra-hero h1 {
+  color: #000000;
+  letter-spacing: -0.04em;
+  margin-bottom: 0.25rem;
+}
+.gra-panel {
+  border: 1px solid #111111;
+  padding: 1rem;
+  background: #ffffff;
+}
+.gra-board pre {
+  background: #000000;
+  color: #ffffff;
+  padding: 1rem;
+  border-radius: 0;
+  font-family: "SFMono-Regular", "Cascadia Code", "Roboto Mono", Menlo, monospace;
+  line-height: 1.35;
+}
+.gra-log {
+  max-height: 560px;
+  overflow-y: auto;
+}
+.gra-button button {
+  background: #000000 !important;
+  color: #ffffff !important;
+  border: 2px solid #000000 !important;
+  border-radius: 0 !important;
+  font-weight: 800 !important;
+}
+.gra-secondary button {
+  background: #ffffff !important;
+  color: #000000 !important;
+  border: 1px solid #111111 !important;
+  border-radius: 0 !important;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Small helpers for model/game mapping and logging metadata
+# ---------------------------------------------------------------------------
+
+def _resolve_game(label: str) -> str:
+    return GAME_CHOICES.get(label, "tic_tac_toe")
+
+
+def _resolve_model(label: str) -> Tuple[str, str]:
+    preset = MODEL_CHOICES.get(label) or MODEL_CHOICES["Remote / OpenAI GPT-4o-mini"]
+    return preset["model"], preset["env_var"]
+
+
+def _agent_config(agent_type: str, model_label: str) -> Dict[str, str]:
+    if agent_type == "llm":
+        model_name, _ = _resolve_model(model_label)
+        return {"type": "llm", "model": model_name}
+    return {"type": "random"}
+
+
+def _agent_metadata(config: Dict[str, Any], player_id: int) -> Tuple[str, str]:
+    agent = config["agents"].get(f"player_{player_id}", {"type": "unknown"})
+    agent_type = agent.get("type", "unknown")
+    model = agent.get("model", "None") if agent_type == "llm" else "None"
+    return agent_type, model
+
+
+def _opponent_label(config: Dict[str, Any], player_id: int) -> str:
+    labels = []
+    for key, agent in config["agents"].items():
+        if key == f"player_{player_id}":
+            continue
+        agent_type = agent.get("type", "unknown")
+        model = agent.get("model", "None") if agent_type == "llm" else "None"
+        labels.append(f"{agent_type}_{model.replace('-', '_')}")
+    return ", ".join(labels) if labels else "single_player"
+
+
+def _extract_action_and_reasoning(response: Any) -> Tuple[int, str]:
+    if isinstance(response, dict):
+        return response.get("action", -1), response.get("reasoning", "None")
+    return int(response), "None"
+
+
+def _render_board(env: Any, player_id: int = 0) -> str:
+    try:
+        rendered = env.render_board(player_id)
+    except Exception:
+        rendered = str(env.state)
+    return f"```text\n{rendered}\n```"
+
+
+def _status_text(
+    episode: int,
+    num_episodes: int,
+    turn: int,
+    rewards: Dict[int, float],
+    complete: bool,
+) -> str:
+    state = "COMPLETE" if complete else "RUNNING"
+    return (
+        f"**Status:** {state}\n\n"
+        f"**Episode:** {episode}/{num_episodes}  \n"
+        f"**Turn:** {turn}  \n"
+        f"**Rewards:** `{rewards}`"
+    )
+
+
+def _build_config(
+    game_name: str,
+    seed: int,
+    num_players: int,
+    player0_type: str,
+    player0_model_label: str,
+    player1_type: str,
+    player1_model_label: str,
+) -> Dict[str, Any]:
+    agents = {
+        "player_0": _agent_config(player0_type, player0_model_label),
+    }
+    if num_players > 1:
+        agents["player_1"] = _agent_config(player1_type, player1_model_label)
+
+    return {
+        "env_config": {"game_name": game_name, "max_game_rounds": None},
+        "num_episodes": 1,
+        "seed": seed,
+        "use_ray": False,
+        "mode": "frontend_live",
+        "agents": agents,
+        "llm_backend": {
+            "max_tokens": 250,
+            "temperature": 0.1,
+            "default_model": agents["player_0"].get("model", "None"),
+        },
+        "tensorboard_logging": False,
+        "run_post_processing": False,
+    }
+
+
+def _set_api_keys(
+    openai_key: str,
+    groq_key: str,
+    openrouter_key: str,
+    gemini_key: str,
+) -> None:
+    load_dotenv()
+    key_map = {
+        "OPENAI_API_KEY": openai_key,
+        "GROQ_API_KEY": groq_key,
+        "OPENROUTER_API_KEY": openrouter_key,
+        "GEMINI_API_KEY": gemini_key,
+    }
+    for env_var, value in key_map.items():
+        if value and value.strip():
+            os.environ[env_var] = value.strip()
+
+
+def _validate_keys_for_agents(config: Dict[str, Any]) -> Optional[str]:
+    missing = []
+    for agent in config["agents"].values():
+        if agent.get("type") != "llm":
+            continue
+        model_name = agent.get("model", "")
+        env_var = ""
+        for preset in MODEL_CHOICES.values():
+            if preset["model"] == model_name:
+                env_var = preset["env_var"]
+                break
+        if env_var and not os.getenv(env_var):
+            missing.append(env_var)
+
+    if missing:
+        return "Missing API key(s): " + ", ".join(sorted(set(missing)))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Export and chart helpers
+# ---------------------------------------------------------------------------
+
+def _write_exports(
+    run_name: str,
+    metadata: Dict[str, Any],
+    move_records: List[Dict[str, Any]],
+    result_records: List[Dict[str, Any]],
+) -> Tuple[str, str]:
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    safe_name = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in run_name)
+    safe_name = safe_name.strip("._-") or "game_reasoning_run"
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    base = EXPORT_DIR / f"{safe_name}_{timestamp}"
+    csv_path = base.with_suffix(".csv")
+    json_path = base.with_suffix(".json")
+
+    payload = {
+        "metadata": metadata,
+        "moves": move_records,
+        "game_results": result_records,
+    }
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    fieldnames = [
+        "run_name",
+        "game_name",
+        "episode",
+        "turn",
+        "player_id",
+        "action",
+        "reasoning",
+        "opponent",
+        "generation_time",
+        "agent_type",
+        "agent_model",
+        "timestamp",
+        "run_id",
+        "seed",
+        "board_state",
+        "legal_actions",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in move_records:
+            writer.writerow({field: record.get(field, "") for field in fieldnames})
+
+    return str(csv_path), str(json_path)
+
+
+def _scale_points(values: List[Tuple[int, float]], width: int, height: int) -> str:
+    if not values:
+        return ""
+    xs = [episode for episode, _ in values]
+    ys = [reward for _, reward in values]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    x_span = max(max_x - min_x, 1)
+    y_span = max(max_y - min_y, 1)
+    points = []
+    for episode, reward in values:
+        x = 40 + ((episode - min_x) / x_span) * (width - 80)
+        y = height - 35 - ((reward - min_y) / y_span) * (height - 70)
+        points.append(f"{x:.1f},{y:.1f}")
+    return " ".join(points)
+
+
+def _bar_svg(title: str, labels: List[str], values: List[float]) -> str:
+    width, height = 520, 260
+    max_value = max(values) if values else 1
+    max_value = max(max_value, 1)
+    bar_width = 70
+    gap = 35
+    start_x = 55
+    bars = []
+    for idx, (label, value) in enumerate(zip(labels, values)):
+        x = start_x + idx * (bar_width + gap)
+        bar_height = (value / max_value) * 150
+        y = 190 - bar_height
+        bars.append(
+            f"<rect x='{x}' y='{y:.1f}' width='{bar_width}' height='{bar_height:.1f}' "
+            "fill='white' stroke='black' stroke-width='2'/>"
+            f"<text x='{x + bar_width / 2}' y='215' text-anchor='middle' "
+            "font-size='12'>{label}</text>"
+            f"<text x='{x + bar_width / 2}' y='{y - 8:.1f}' text-anchor='middle' "
+            "font-size='12' font-weight='700'>{value:g}</text>"
+        )
+    return (
+        "<div class='gra-panel'>"
+        f"<h3>{title}</h3>"
+        f"<svg viewBox='0 0 {width} {height}' width='100%' height='260'>"
+        "<line x1='35' y1='190' x2='490' y2='190' stroke='black'/>"
+        + "".join(bars)
+        + "</svg></div>"
+    )
+
+
+def _make_charts(result_records: List[Dict[str, Any]], move_records: List[Dict[str, Any]]):
+    """Create dependency-free SVG/HTML charts for the frontend.
+
+    The upstream project has richer matplotlib/seaborn analysis scripts. This
+    live frontend provides lightweight summary charts without requiring those
+    plotting dependencies at runtime.
+    """
+    # Chart 1: reward by episode/player.
+    by_player: Dict[int, List[Tuple[int, float]]] = {}
+    for record in result_records:
+        by_player.setdefault(record["player_id"], []).append(
+            (record["episode"], record["reward"])
+        )
+    width, height = 640, 260
+    polylines = []
+    for player_id, values in sorted(by_player.items()):
+        points = _scale_points(sorted(values), width, height)
+        dash = " stroke-dasharray='6 4'" if player_id else ""
+        polylines.append(
+            f"<polyline points='{points}' fill='none' stroke='black' "
+            f"stroke-width='2'{dash}/>"
+        )
+    reward_chart = (
+        "<div class='gra-panel'><h3>Rewards by Episode</h3>"
+        f"<svg viewBox='0 0 {width} {height}' width='100%' height='260'>"
+        "<line x1='40' y1='225' x2='600' y2='225' stroke='black'/>"
+        "<line x1='40' y1='25' x2='40' y2='225' stroke='black'/>"
+        + "".join(polylines)
+        + "<text x='42' y='18' font-size='12'>reward</text>"
+        + "<text x='560' y='245' font-size='12'>episode</text>"
+        + "</svg><p>Solid line = Player 0; dashed line = Player 1.</p></div>"
+    )
+
+    # Chart 2: player 0 outcome counts.
+    counts = {"win": 0, "loss": 0, "draw": 0}
+    for record in result_records:
+        if record["player_id"] != 0:
+            continue
+        reward = record["reward"]
+        if reward > 0:
+            counts["win"] += 1
+        elif reward < 0:
+            counts["loss"] += 1
+        else:
+            counts["draw"] += 1
+    outcome_chart = _bar_svg(
+        "Player 0 Outcomes",
+        list(counts.keys()),
+        [counts["win"], counts["loss"], counts["draw"]],
+    )
+
+    # Chart 3: moves per episode.
+    turns_by_episode: Dict[int, int] = {}
+    for record in move_records:
+        episode = int(record["episode"])
+        turns_by_episode[episode] = max(turns_by_episode.get(episode, 0), int(record["turn"]) + 1)
+    sorted_episodes = sorted(turns_by_episode.keys())
+    turns_chart = _bar_svg(
+        "Turns per Episode",
+        [str(episode) for episode in sorted_episodes],
+        [turns_by_episode[episode] for episode in sorted_episodes],
+    )
+
+    return reward_chart, outcome_chart, turns_chart
+
+
+# ---------------------------------------------------------------------------
+# Live experiment runner
+# ---------------------------------------------------------------------------
+
+def run_experiment_live(
+    run_name: str,
+    game_label: str,
+    num_episodes: int,
+    seed: int,
+    player0_type: str,
+    player0_model_label: str,
+    player1_type: str,
+    player1_model_label: str,
+    openai_key: str,
+    groq_key: str,
+    openrouter_key: str,
+    gemini_key: str,
+    max_turns: int,
+    delay_seconds: float,
+) -> Generator[Tuple[str, str, str, Any, Any, Any, Any, Any], None, None]:
+    """Run an original-methodology Game Reasoning Arena experiment live."""
+    if not run_name.strip():
+        yield (
+            "```text\nNo board yet.\n```",
+            "Name the run before starting.",
+            "Status: not started",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        return
+
+    _set_api_keys(openai_key, groq_key, openrouter_key, gemini_key)
+
+    try:
+        from game_reasoning_arena.arena.games.registry import registry
+        from game_reasoning_arena.arena.utils.loggers import SQLiteLogger
+        from game_reasoning_arena.arena.utils.seeding import set_seed
+        from game_reasoning_arena.arena.agents.policy_manager import initialize_policies
+        from game_reasoning_arena.backends import initialize_llm_registry
+    except ImportError as exc:
+        yield (
+            "```text\nNo board yet.\n```",
+            f"Missing dependency: {exc}",
+            "Status: dependency error",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        return
+
+    game_name = _resolve_game(game_label)
+    game = registry.get_game_loader(game_name)()
+    num_players = game.num_players()
+    num_episodes = max(1, int(num_episodes))
+    seed = int(seed)
+    max_turns = max(1, int(max_turns))
+    delay_seconds = float(delay_seconds)
+
+    config = _build_config(
+        game_name=game_name,
+        seed=seed,
+        num_players=num_players,
+        player0_type=player0_type,
+        player0_model_label=player0_model_label,
+        player1_type=player1_type,
+        player1_model_label=player1_model_label,
+    )
+
+    missing_key_message = _validate_keys_for_agents(config)
+    if missing_key_message:
+        yield (
+            "```text\nNo board yet.\n```",
+            missing_key_message,
+            "Status: missing API key",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        return
+
+    if any(agent.get("type") == "llm" for agent in config["agents"].values()):
+        initialize_llm_registry()
+
+    loggers = {}
+    for player_id in range(num_players):
+        agent_type, model_name = _agent_metadata(config, player_id)
+        sanitized_model = model_name.replace("-", "_").replace("/", "_")
+        loggers[player_id] = SQLiteLogger(agent_type, sanitized_model)
+
+    run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    metadata = {
+        "run_name": run_name,
+        "run_id": run_id,
+        "game_name": game_name,
+        "game_label": game_label,
+        "num_episodes": num_episodes,
+        "seed": seed,
+        "agents": config["agents"],
+        "methodology": "Game Reasoning Arena live frontend using OpenSpiel registry, policy_manager, LLMAgent/RandomAgent, and SQLiteLogger",
+    }
+    move_records: List[Dict[str, Any]] = []
+    result_records: List[Dict[str, Any]] = []
+    transcript = [
+        "# Game Reasoning Arena Live Run",
+        f"- Run: `{run_name}`",
+        f"- Game: `{game_name}`",
+        f"- Episodes: `{num_episodes}`",
+        f"- Seed: `{seed}`",
+        f"- Agents: `{config['agents']}`",
+        "",
+    ]
+
+    last_board = "```text\nNo board yet.\n```"
+
+    for episode_index in range(num_episodes):
+        episode = episode_index + 1
+        episode_seed = seed + episode_index
+        set_seed(episode_seed)
+
+        policies = initialize_policies(config, game_name, episode_seed)
+        player_to_agent = {
+            player_id: policy for player_id, policy in enumerate(policies.values())
+        }
+        env = registry.make_env(game_name, config)
+        observations, _ = env.reset(seed=episode_seed)
+        rewards = {player_id: 0.0 for player_id in range(num_players)}
+        terminated = truncated = False
+        turn = 0
+
+        transcript.append(f"\n## Episode {episode}/{num_episodes}")
+        transcript.append(f"Seed: `{episode_seed}`")
+        last_board = _render_board(env, 0)
+        yield (
+            last_board,
+            "\n".join(transcript),
+            _status_text(episode, num_episodes, turn, rewards, False),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+        while not (terminated or truncated):
+            if turn >= max_turns:
+                truncated = True
+                transcript.append(f"Episode truncated at max_turns={max_turns}.")
+                break
+
+            if env.state.is_simultaneous_node():
+                active_players = list(range(num_players))
+            else:
+                active_players = [env.state.current_player()]
+
+            action_dict = {}
+            for player_id in active_players:
+                observation = observations[player_id]
+                legal_actions = observation["legal_actions"]
+                response = player_to_agent[player_id](observation)
+                action, reasoning = _extract_action_and_reasoning(response)
+
+                agent_type, agent_model = _agent_metadata(config, player_id)
+                transcript.append(
+                    f"\nEpisode {episode}, Turn {turn}, Player {player_id}"
+                )
+                transcript.append(f"Legal actions: `{legal_actions}`")
+                transcript.append(f"Chosen action: `{action}`")
+                if agent_type == "llm":
+                    transcript.append(f"Reasoning: {reasoning}")
+
+                if action not in legal_actions:
+                    loggers[player_id].log_illegal_move(
+                        game_name=game_name,
+                        episode=episode,
+                        turn=turn,
+                        agent_id=player_id,
+                        illegal_action=action,
+                        reason="Illegal action",
+                        board_state=observation.get("state_string", ""),
+                    )
+                    truncated = True
+                    transcript.append("Illegal move detected; episode truncated.")
+                    break
+
+                action_dict[player_id] = action
+                record = {
+                    "run_name": run_name,
+                    "game_name": game_name,
+                    "episode": episode,
+                    "turn": turn,
+                    "player_id": player_id,
+                    "action": action,
+                    "reasoning": reasoning,
+                    "opponent": _opponent_label(config, player_id),
+                    "generation_time": 0.0,
+                    "agent_type": agent_type,
+                    "agent_model": agent_model,
+                    "timestamp": datetime.now().isoformat(),
+                    "run_id": run_id,
+                    "seed": episode_seed,
+                    "board_state": observation.get("state_string", ""),
+                    "legal_actions": json.dumps(legal_actions),
+                }
+                move_records.append(record)
+                loggers[player_id].log_move(
+                    game_name=game_name,
+                    episode=episode,
+                    turn=turn,
+                    action=action,
+                    reasoning=reasoning,
+                    opponent=record["opponent"],
+                    generation_time=0.0,
+                    agent_type=agent_type,
+                    agent_model=agent_model,
+                    seed=episode_seed,
+                    board_state=record["board_state"],
+                )
+
+            if truncated:
+                break
+
+            observations, step_rewards, terminated, truncated, _ = env.step(action_dict)
+            rewards.update(step_rewards)
+            turn += 1
+            last_board = _render_board(env, 0)
+
+            yield (
+                last_board,
+                "\n".join(transcript),
+                _status_text(episode, num_episodes, turn, rewards, terminated or truncated),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+
+        status = "truncated" if truncated else "terminated"
+        transcript.append(f"Episode {episode} finished with status `{status}` and rewards `{rewards}`.")
+
+        for player_id, reward in rewards.items():
+            opponent = _opponent_label(config, player_id)
+            loggers[player_id].log_rewards(game_name, episode, reward)
+            loggers[player_id].log_game_result(
+                game_name=game_name,
+                episode=episode,
+                status=status,
+                reward=reward,
+                opponent=opponent,
+            )
+            result_records.append({
+                "run_name": run_name,
+                "game_name": game_name,
+                "episode": episode,
+                "player_id": player_id,
+                "status": status,
+                "reward": reward,
+                "opponent": opponent,
+                "timestamp": datetime.now().isoformat(),
+                "run_id": run_id,
+            })
+
+    metadata["completed_at"] = datetime.utcnow().isoformat()
+    csv_path, json_path = _write_exports(run_name, metadata, move_records, result_records)
+    reward_fig, outcome_fig, turns_fig = _make_charts(result_records, move_records)
+    transcript.append("\n## Outputs")
+    transcript.append(f"- CSV: `{csv_path}`")
+    transcript.append(f"- JSON: `{json_path}`")
+
+    yield (
+        last_board,
+        "\n".join(transcript),
+        _status_text(num_episodes, num_episodes, 0, {}, True),
+        csv_path,
+        json_path,
+        reward_fig,
+        outcome_fig,
+        turns_fig,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gradio UI
+# ---------------------------------------------------------------------------
+
+def build_app() -> Any:
+    try:
+        import gradio as gr
+    except ImportError as exc:
+        raise ImportError(
+            "gradio is required for the frontend. Install it with: python3 -m pip install gradio"
+        ) from exc
+
+    with gr.Blocks(title="Game Reasoning Arena Frontend") as demo:
+        gr.HTML(f"<style>{APP_CSS}</style>")
+        gr.Markdown(
+            "# Game Reasoning Arena Frontend\n"
+            "OpenSpiel-based LLM game evaluation following the original repository methodology.",
+            elem_classes=["gra-hero"],
+        )
+
+        with gr.Row():
+            with gr.Column(scale=1, elem_classes=["gra-panel"]):
+                run_name = gr.Textbox(
+                    label="Run name",
+                    placeholder="example_connect_four_gemini_10eps",
+                )
+                game = gr.Dropdown(
+                    choices=list(GAME_CHOICES.keys()),
+                    value="Tic-Tac-Toe",
+                    label="OpenSpiel game",
+                )
+                num_episodes = gr.Number(label="Episodes", value=1, precision=0)
+                seed = gr.Number(label="Seed", value=42, precision=0)
+                max_turns = gr.Number(label="Max turns per episode", value=80, precision=0)
+                delay_seconds = gr.Slider(
+                    label="Live delay between turns",
+                    minimum=0,
+                    maximum=3,
+                    value=0.25,
+                    step=0.25,
+                )
+
+            with gr.Column(scale=1, elem_classes=["gra-panel"]):
+                gr.Markdown("### Agents")
+                player0_type = gr.Dropdown(AGENT_TYPES, value="llm", label="Player 0 type")
+                player0_model = gr.Dropdown(
+                    list(MODEL_CHOICES.keys()),
+                    value="Remote / OpenRouter Gemini 2.5 Flash",
+                    label="Player 0 model",
+                )
+                player1_type = gr.Dropdown(AGENT_TYPES, value="random", label="Player 1 type")
+                player1_model = gr.Dropdown(
+                    list(MODEL_CHOICES.keys()),
+                    value="Remote / Groq Llama 3.1 8B Instant",
+                    label="Player 1 model",
+                )
+
+            with gr.Column(scale=1, elem_classes=["gra-panel"]):
+                gr.Markdown("### API keys")
+                openai_key = gr.Textbox(label="OpenAI API key", type="password")
+                groq_key = gr.Textbox(label="Groq API key", type="password")
+                openrouter_key = gr.Textbox(label="OpenRouter API key", type="password")
+                gemini_key = gr.Textbox(label="Google Gemini API key", type="password")
+
+        run_button = gr.Button("Run experiment", variant="primary", elem_classes=["gra-button"])
+
+        with gr.Row():
+            board = gr.Markdown("```text\nNo game running.\n```", elem_classes=["gra-board"])
+            status = gr.Markdown("Status: idle", elem_classes=["gra-panel"])
+
+        transcript = gr.Markdown(
+            "Reasoning traces and episode logs will appear here.",
+            elem_classes=["gra-panel", "gra-log"],
+        )
+
+        with gr.Row():
+            csv_file = gr.File(label="Download CSV")
+            json_file = gr.File(label="Download JSON")
+
+        with gr.Row():
+            reward_plot = gr.HTML(label="Rewards by episode")
+            outcome_plot = gr.HTML(label="Player 0 outcomes")
+            turns_plot = gr.HTML(label="Turns per episode")
+
+        run_button.click(
+            fn=run_experiment_live,
+            inputs=[
+                run_name,
+                game,
+                num_episodes,
+                seed,
+                player0_type,
+                player0_model,
+                player1_type,
+                player1_model,
+                openai_key,
+                groq_key,
+                openrouter_key,
+                gemini_key,
+                max_turns,
+                delay_seconds,
+            ],
+            outputs=[
+                board,
+                transcript,
+                status,
+                csv_file,
+                json_file,
+                reward_plot,
+                outcome_plot,
+                turns_plot,
+            ],
+        )
+
+    return demo
+
+
+if __name__ == "__main__":
+    build_app().launch(server_name="0.0.0.0", server_port=7861)

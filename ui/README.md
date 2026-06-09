@@ -44,6 +44,17 @@ From the project root directory:
 python app.py
 ```
 
+For a frontend that follows the original Game Reasoning Arena methodology
+directly, use:
+
+```bash
+python3 game_reasoning_arena_frontend.py
+```
+
+This UI uses the repository's OpenSpiel registry, policy manager, backend model
+prefixes, `LLMAgent` / `RandomAgent`, SQLite logging, CSV/JSON exports, and
+frontend charts for rewards, outcomes, and turns per episode.
+
 For the lightweight Arkadium Testing Arena live game viewer:
 
 ```bash
