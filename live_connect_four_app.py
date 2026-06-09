@@ -11,15 +11,21 @@ paste the matching API key, and click "Run selected model vs Random".
 
 from __future__ import annotations
 
+import csv
+import json
 import os
+import re
 import sys
 import time
+import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Tuple
 
 
 ROOT_DIR = Path(__file__).resolve().parent
 SRC_DIR = ROOT_DIR / "src"
+EXPORT_DIR = ROOT_DIR / "results" / "live_exports"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
@@ -79,6 +85,71 @@ def _resolve_preset(model_preset: str) -> Tuple[str, str, str]:
         preset["env_var"],
         preset.get("unsupported_reason", ""),
     )
+
+
+def _sanitize_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return cleaned.strip("._-") or "unnamed_game_set"
+
+
+def _write_export_bundle(
+    game_set_name: str,
+    metadata: Dict[str, Any],
+    turn_records: List[Dict[str, Any]],
+    round_records: List[Dict[str, Any]],
+    transcript: List[str],
+) -> str:
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_name = _sanitize_name(game_set_name)
+    base_path = EXPORT_DIR / f"{safe_name}_{timestamp}"
+    json_path = base_path.with_suffix(".json")
+    csv_path = base_path.with_suffix(".csv")
+    zip_path = base_path.with_suffix(".zip")
+
+    payload = {
+        "metadata": metadata,
+        "rounds": round_records,
+        "turns": turn_records,
+        "transcript": transcript,
+    }
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    fieldnames = [
+        "game_set_name",
+        "game",
+        "game_display_name",
+        "model_preset",
+        "model_name",
+        "round",
+        "turn",
+        "player_id",
+        "agent_type",
+        "agent_model",
+        "legal_actions",
+        "chosen_action",
+        "reasoning",
+        "outcome",
+        "round_status",
+        "rewards",
+        "state_before",
+        "state_after",
+        "board_before",
+        "board_after",
+        "seed",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in turn_records:
+            writer.writerow({field: record.get(field, "") for field in fieldnames})
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.write(json_path, arcname=json_path.name)
+        zf.write(csv_path, arcname=csv_path.name)
+
+    return str(zip_path)
 
 
 def _build_config(
@@ -195,14 +266,26 @@ def _classify_player_outcome(
 
 def run_live_match(
     api_key: str,
+    game_set_name: str,
     seed: int,
     game_preset: str,
     model_preset: str,
     rounds: int,
+    save_game_data: bool,
     delay_seconds: float,
     max_turns: int,
-) -> Generator[Tuple[str, str, str], None, None]:
+) -> Generator[Tuple[str, str, str, Any], None, None]:
     """Run one or more game rounds and stream board/log/status updates."""
+    game_set_name = (game_set_name or "").strip()
+    if not game_set_name:
+        yield (
+            "No board yet.",
+            "Name this set of games before running it.",
+            "Status: not started",
+            None,
+        )
+        return
+
     seed = int(seed)
     rounds = max(1, int(rounds))
     max_turns = int(max_turns)
@@ -217,6 +300,7 @@ def run_live_match(
             "No board yet.",
             f"{model_preset} cannot run this match.\n\n{unsupported_reason}",
             "Status: unsupported provider",
+            None,
         )
         return
 
@@ -231,6 +315,7 @@ def run_live_match(
             f"Missing API key for {model_preset}. Paste it in the password "
             f"box or set {api_key_env_var}.",
             "Status: not started",
+            None,
         )
         return
 
@@ -250,6 +335,7 @@ def run_live_match(
             "Install the UI/runtime dependencies, for example:\n"
             "python3 -m pip install open-spiel litellm gradio python-dotenv",
             "Status: dependency error",
+            None,
         )
         return
 
@@ -260,6 +346,7 @@ def run_live_match(
             "No board yet.",
             f"Failed to load game `{game_name}`:\n{type(exc).__name__}: {exc}",
             "Status: game load error",
+            None,
         )
         return
 
@@ -270,8 +357,9 @@ def run_live_match(
         num_players=num_players,
     )
     transcript: List[str] = [
-        "# Live Game Match: LLM vs Random",
+        "# Arkadium Testing Arena Run",
         "",
+        f"- Game set: {game_set_name}",
         f"- Game: {game_preset} (`{game_name}`)",
         f"- Preset: {model_preset}",
         f"- Player 0: LLM `{model_name}`",
@@ -290,6 +378,7 @@ def run_live_match(
             "Failed to initialize the match:\n"
             f"{type(exc).__name__}: {exc}",
             "Status: initialization error",
+            None,
         )
         return
 
@@ -301,7 +390,23 @@ def run_live_match(
 
     summary_counts = {"win": 0, "loss": 0, "draw": 0}
     round_summaries: List[str] = []
+    round_records: List[Dict[str, Any]] = []
+    turn_records: List[Dict[str, Any]] = []
     last_board = "No board yet."
+    export_path = None
+    metadata = {
+        "game_set_name": game_set_name,
+        "game": game_name,
+        "game_display_name": game_preset,
+        "model_preset": model_preset,
+        "model_name": model_name,
+        "api_key_env_var": api_key_env_var,
+        "rounds_requested": rounds,
+        "base_seed": seed,
+        "max_turns_per_round": max_turns,
+        "num_players": num_players,
+        "started_at_utc": datetime.utcnow().isoformat(),
+    }
 
     for round_index in range(rounds):
         round_number = round_index + 1
@@ -323,6 +428,7 @@ def run_live_match(
                 + f"Failed to initialize round {round_number}:\n"
                 + f"`{type(exc).__name__}: {exc}`",
                 "Status: round initialization error",
+                export_path,
             )
             return
 
@@ -340,6 +446,7 @@ def run_live_match(
             _format_status(
                 round_number, rounds, turn, rewards, False, summary_counts
             ),
+            export_path,
         )
 
         while not (terminated or truncated):
@@ -352,6 +459,8 @@ def run_live_match(
             observation = observations[current_player]
             legal_actions = observation["legal_actions"]
             agent = player_to_agent[current_player]
+            state_before = observation.get("state_string", "")
+            board_before = env.render_board(0)
 
             transcript.append(f"\n## Round {round_number}, Turn {turn}: Player {current_player}")
             transcript.append(f"Legal actions: `{legal_actions}`")
@@ -368,6 +477,7 @@ def run_live_match(
                     _render_board(env),
                     "\n".join(transcript),
                     "Status: action generation error",
+                    export_path,
                 )
                 return
 
@@ -392,6 +502,7 @@ def run_live_match(
                     _render_board(env),
                     "\n".join(transcript),
                     "Status: illegal move",
+                    export_path,
                 )
                 return
 
@@ -413,6 +524,33 @@ def run_live_match(
                 {current_player: action}
             )
             rewards.update(step_rewards)
+            state_after = "" if terminated or truncated else observations[
+                env.state.current_player()
+            ].get("state_string", "")
+            board_after = env.render_board(0)
+            turn_records.append({
+                "game_set_name": game_set_name,
+                "game": game_name,
+                "game_display_name": game_preset,
+                "model_preset": model_preset,
+                "model_name": model_name,
+                "round": round_number,
+                "turn": turn,
+                "player_id": current_player,
+                "agent_type": agent_type,
+                "agent_model": agent_model,
+                "legal_actions": json.dumps(legal_actions),
+                "chosen_action": action,
+                "reasoning": reasoning,
+                "outcome": "",
+                "round_status": "",
+                "rewards": json.dumps(rewards),
+                "state_before": state_before,
+                "state_after": state_after,
+                "board_before": board_before,
+                "board_after": board_after,
+                "seed": round_seed,
+            })
             turn += 1
             last_board = _render_board(env)
 
@@ -427,6 +565,7 @@ def run_live_match(
                     terminated or truncated,
                     summary_counts,
                 ),
+                export_path,
             )
 
             if delay_seconds > 0:
@@ -442,6 +581,21 @@ def run_live_match(
             f"(status={final_status}, rewards={rewards})"
         )
         round_summaries.append(round_summary)
+        round_records.append({
+            "game_set_name": game_set_name,
+            "game": game_name,
+            "game_display_name": game_preset,
+            "round": round_number,
+            "seed": round_seed,
+            "status": final_status,
+            "player0_outcome": player0_outcome,
+            "rewards": rewards.copy(),
+            "turns": turn,
+        })
+        for record in turn_records:
+            if record["round"] == round_number:
+                record["outcome"] = player0_outcome
+                record["round_status"] = final_status
         transcript.append(f"\n## {round_summary}")
 
         for player_id, reward in rewards.items():
@@ -468,10 +622,25 @@ def run_live_match(
             _format_status(
                 round_number, rounds, turn, rewards, True, summary_counts
             ),
+            export_path,
         )
 
     transcript.append("\n# Final summary")
     transcript.append(f"Player 0 outcomes: `{summary_counts}`")
+    if save_game_data:
+        metadata["completed_at_utc"] = datetime.utcnow().isoformat()
+        metadata["summary_counts"] = summary_counts.copy()
+        export_path = _write_export_bundle(
+            game_set_name=game_set_name,
+            metadata=metadata,
+            turn_records=turn_records,
+            round_records=round_records,
+            transcript=transcript,
+        )
+        transcript.append(f"Download export: `{export_path}`")
+    else:
+        transcript.append("Export saving was disabled for this run.")
+
     yield (
         last_board,
         "\n".join(transcript),
@@ -483,6 +652,7 @@ def run_live_match(
             True,
             summary_counts,
         ),
+        export_path,
     )
 
 
@@ -495,21 +665,26 @@ def build_app() -> Any:
             "python3 -m pip install gradio"
         ) from exc
 
-    with gr.Blocks(title="Live Game LLM Match") as demo:
+    with gr.Blocks(title="Arkadium Testing Arena") as demo:
         gr.Markdown(
-            "# Live Game Match: LLM vs Random\n"
-            "Choose a game and provider/model preset, paste that provider's "
-            "API key locally, choose how many rounds to run, and watch the "
-            "match stream turn by turn. The key is placed in this Python "
-            "process as the selected provider's API-key environment variable; "
-            "it is not written to result logs."
+            "# Arkadium Testing Arena\n"
+            "Name a set of games, choose a game and provider/model preset, "
+            "paste that provider's API key locally, choose how many rounds "
+            "to run, and watch the match stream turn by turn. The key is "
+            "placed in this Python process as the selected provider's "
+            "API-key environment variable; it is not written to result logs."
+        )
+
+        game_set_name = gr.Textbox(
+            label="Game set name",
+            placeholder="Example: connect4_gemini_10_rounds_trial_1",
         )
 
         with gr.Row():
             api_key = gr.Textbox(
                 label="Provider API key",
                 type="password",
-                placeholder="OpenAI, Groq, or OpenRouter key",
+                placeholder="OpenAI, Groq, OpenRouter, or Google Gemini key",
             )
             model_preset = gr.Dropdown(
                 label="Model preset",
@@ -525,6 +700,10 @@ def build_app() -> Any:
         with gr.Row():
             seed = gr.Number(label="Seed", value=42, precision=0)
             rounds = gr.Number(label="Rounds", value=1, precision=0)
+            save_game_data = gr.Checkbox(
+                label="Save/export game data",
+                value=True,
+            )
             delay_seconds = gr.Slider(
                 label="Delay between turns",
                 minimum=0.0,
@@ -541,19 +720,22 @@ def build_app() -> Any:
             status = gr.Textbox(label="Status", lines=4)
 
         transcript = gr.Markdown(label="Turn log and reasoning trace")
+        export_file = gr.File(label="Download game set export")
 
         run_button.click(
             fn=run_live_match,
             inputs=[
                 api_key,
+                game_set_name,
                 seed,
                 game_preset,
                 model_preset,
                 rounds,
+                save_game_data,
                 delay_seconds,
                 max_turns,
             ],
-            outputs=[board, transcript, status],
+            outputs=[board, transcript, status, export_file],
         )
 
     return demo
