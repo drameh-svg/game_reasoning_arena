@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Lightweight Gradio app for live Connect Four LLM-vs-random matches.
+"""Lightweight Gradio app for live LLM-vs-random game matches.
 
 Run from the repository root:
 
     python3 live_connect_four_app.py
 
-Then open the printed local URL, choose a provider/model preset, paste the
-matching API key, and click "Run selected model vs Random".
+Then open the printed local URL, choose a game and provider/model preset,
+paste the matching API key, and click "Run selected model vs Random".
 """
 
 from __future__ import annotations
@@ -31,7 +31,13 @@ except ImportError:
 
 
 DEFAULT_PRESET = "OpenAI: GPT-4o-mini"
-GAME_NAME = "connect_four"
+DEFAULT_GAME = "connect_four"
+GAME_PRESETS = {
+    "Connect Four": "connect_four",
+    "Tic-Tac-Toe": "tic_tac_toe",
+    "Gin Rummy": "gin_rummy",
+    "Solitaire": "solitaire",
+}
 MODEL_PRESETS = {
     "OpenAI: GPT-4o-mini": {
         "model": "litellm_gpt-4o-mini",
@@ -75,25 +81,33 @@ def _resolve_preset(model_preset: str) -> Tuple[str, str, str]:
     )
 
 
-def _build_config(seed: int, model_name: str) -> Dict[str, Any]:
+def _build_config(
+    game_name: str,
+    seed: int,
+    model_name: str,
+    num_players: int,
+) -> Dict[str, Any]:
+    agents = {
+        "player_0": {
+            "type": "llm",
+            "model": model_name,
+        },
+    }
+    if num_players > 1:
+        agents["player_1"] = {
+            "type": "random",
+        }
+
     return {
         "env_config": {
-            "game_name": GAME_NAME,
+            "game_name": game_name,
             "max_game_rounds": None,
         },
         "num_episodes": 1,
         "seed": seed,
         "use_ray": False,
         "mode": "llm_vs_random",
-        "agents": {
-            "player_0": {
-                "type": "llm",
-                "model": model_name,
-            },
-            "player_1": {
-                "type": "random",
-            },
-        },
+        "agents": agents,
         "llm_backend": {
             "max_tokens": 250,
             "temperature": 0.1,
@@ -119,7 +133,7 @@ def _opponent_label(config: Dict[str, Any], player_id: int) -> str:
         agent_type = agent_config.get("type", "unknown")
         model_name = agent_config.get("model", "None") if agent_type == "llm" else "None"
         labels.append(f"{agent_type}_{model_name.replace('-', '_')}")
-    return ", ".join(labels)
+    return ", ".join(labels) if labels else "single_player"
 
 
 def _extract_action_and_reasoning(response: Any) -> Tuple[int, str]:
@@ -128,31 +142,72 @@ def _extract_action_and_reasoning(response: Any) -> Tuple[int, str]:
     return response, "None"
 
 
-def _render_board(env: Any) -> str:
-    return f"```text\n{env.render_board(0)}\n```"
+def _resolve_game(game_preset: str) -> str:
+    return GAME_PRESETS.get(game_preset) or DEFAULT_GAME
 
 
-def _format_status(turn: int, rewards: Dict[int, float], done: bool) -> str:
+def _render_board(env: Any, player_id: int = 0) -> str:
+    return f"```text\n{env.render_board(player_id)}\n```"
+
+
+def _format_status(
+    round_number: int,
+    total_rounds: int,
+    turn: int,
+    rewards: Dict[int, float],
+    done: bool,
+    summary_counts: Dict[str, int],
+) -> str:
     status = "finished" if done else "running"
     return (
         f"Status: {status}\n"
+        f"Round: {round_number}/{total_rounds}\n"
         f"Turn: {turn}\n"
         f"Rewards: Player 0 = {rewards.get(0, 0)}, "
-        f"Player 1 = {rewards.get(1, 0)}"
+        f"Player 1 = {rewards.get(1, 'n/a')}\n"
+        f"Player 0 outcomes: {summary_counts}"
     )
+
+
+def _classify_player_outcome(
+    rewards: Dict[int, float],
+    player_id: int,
+    num_players: int,
+    truncated: bool,
+) -> str:
+    if truncated:
+        return "loss"
+
+    player_reward = rewards.get(player_id, 0)
+    if num_players == 1:
+        return "win" if player_reward > 0 else "loss"
+
+    opponent_rewards = [
+        reward for pid, reward in rewards.items() if pid != player_id
+    ]
+    best_opponent_reward = max(opponent_rewards) if opponent_rewards else 0
+    if player_reward > best_opponent_reward:
+        return "win"
+    if player_reward < best_opponent_reward:
+        return "loss"
+    return "draw"
 
 
 def run_live_match(
     api_key: str,
     seed: int,
+    game_preset: str,
     model_preset: str,
+    rounds: int,
     delay_seconds: float,
     max_turns: int,
 ) -> Generator[Tuple[str, str, str], None, None]:
-    """Run one Connect Four game and stream board/log/status updates."""
+    """Run one or more game rounds and stream board/log/status updates."""
     seed = int(seed)
+    rounds = max(1, int(rounds))
     max_turns = int(max_turns)
     delay_seconds = float(delay_seconds)
+    game_name = _resolve_game(game_preset)
     model_name, api_key_env_var, unsupported_reason = _resolve_preset(
         model_preset
     )
@@ -198,27 +253,37 @@ def run_live_match(
         )
         return
 
-    config = _build_config(seed=seed, model_name=model_name)
+    try:
+        num_players = registry.get_game_loader(game_name)().num_players()
+    except Exception as exc:
+        yield (
+            "No board yet.",
+            f"Failed to load game `{game_name}`:\n{type(exc).__name__}: {exc}",
+            "Status: game load error",
+        )
+        return
+
+    config = _build_config(
+        game_name=game_name,
+        seed=seed,
+        model_name=model_name,
+        num_players=num_players,
+    )
     transcript: List[str] = [
-        "# Live Connect Four: LLM vs Random",
+        "# Live Game Match: LLM vs Random",
         "",
+        f"- Game: {game_preset} (`{game_name}`)",
         f"- Preset: {model_preset}",
         f"- Player 0: LLM `{model_name}`",
-        "- Player 1: repo RandomAgent",
-        f"- Seed: {seed}",
+        "- Player 1: repo RandomAgent" if num_players > 1 else "- Single-player game",
+        f"- Rounds: {rounds}",
+        f"- Base seed: {seed}",
         "",
     ]
 
     try:
         set_seed(seed)
         initialize_llm_registry()
-        policies = initialize_policies(config, GAME_NAME, seed)
-        player_to_agent = {
-            player_id: policy
-            for player_id, policy in enumerate(policies.values())
-        }
-        env = registry.make_env(GAME_NAME, config)
-        observations, _ = env.reset(seed=seed)
     except Exception as exc:
         yield (
             "No board yet.",
@@ -229,121 +294,195 @@ def run_live_match(
         return
 
     loggers = {}
-    for player_id in player_to_agent:
+    for player_id in range(num_players):
         agent_type, agent_model = _agent_metadata(config, player_id)
         sanitized_model = agent_model.replace("-", "_").replace("/", "_")
         loggers[player_id] = SQLiteLogger(agent_type, sanitized_model)
 
-    rewards = {0: 0.0, 1: 0.0}
-    terminated = truncated = False
-    turn = 0
+    summary_counts = {"win": 0, "loss": 0, "draw": 0}
+    round_summaries: List[str] = []
+    last_board = "No board yet."
 
-    transcript.append("Initial board:")
-    yield _render_board(env), "\n".join(transcript), _format_status(turn, rewards, False)
-
-    while not (terminated or truncated):
-        if turn >= max_turns:
-            truncated = True
-            transcript.append(f"\nStopped after max_turns={max_turns}.")
-            break
-
-        current_player = env.state.current_player()
-        observation = observations[current_player]
-        legal_actions = observation["legal_actions"]
-        agent = player_to_agent[current_player]
-
-        transcript.append(f"\n## Turn {turn}: Player {current_player}")
-        transcript.append(f"Legal actions: `{legal_actions}`")
-
+    for round_index in range(rounds):
+        round_number = round_index + 1
+        round_seed = seed + round_index
         try:
-            response = agent(observation)
-            action, reasoning = _extract_action_and_reasoning(response)
+            set_seed(round_seed)
+            policies = initialize_policies(config, game_name, round_seed)
+            player_to_agent = {
+                player_id: policy
+                for player_id, policy in enumerate(policies.values())
+            }
+            env = registry.make_env(game_name, config)
+            observations, _ = env.reset(seed=round_seed)
         except Exception as exc:
-            transcript.append(
-                "Action generation failed:\n"
-                f"`{type(exc).__name__}: {exc}`"
-            )
             yield (
-                _render_board(env),
-                "\n".join(transcript),
-                "Status: action generation error",
+                last_board,
+                "\n".join(transcript)
+                + "\n\n"
+                + f"Failed to initialize round {round_number}:\n"
+                + f"`{type(exc).__name__}: {exc}`",
+                "Status: round initialization error",
             )
             return
 
-        agent_type, agent_model = _agent_metadata(config, current_player)
-        transcript.append(f"Chosen action: `{action}`")
-        if agent_type == "llm":
-            transcript.append("Reasoning trace:")
-            transcript.append(f"> {reasoning}")
+        rewards = {player_id: 0.0 for player_id in range(num_players)}
+        terminated = truncated = False
+        turn = 0
 
-        if action not in legal_actions:
-            loggers[current_player].log_illegal_move(
-                game_name=GAME_NAME,
-                episode=1,
+        transcript.append(f"\n# Round {round_number}/{rounds}")
+        transcript.append(f"Seed: `{round_seed}`")
+        transcript.append("Initial board:")
+        last_board = _render_board(env)
+        yield (
+            last_board,
+            "\n".join(transcript),
+            _format_status(
+                round_number, rounds, turn, rewards, False, summary_counts
+            ),
+        )
+
+        while not (terminated or truncated):
+            if turn >= max_turns:
+                truncated = True
+                transcript.append(f"\nStopped after max_turns={max_turns}.")
+                break
+
+            current_player = env.state.current_player()
+            observation = observations[current_player]
+            legal_actions = observation["legal_actions"]
+            agent = player_to_agent[current_player]
+
+            transcript.append(f"\n## Round {round_number}, Turn {turn}: Player {current_player}")
+            transcript.append(f"Legal actions: `{legal_actions}`")
+
+            try:
+                response = agent(observation)
+                action, reasoning = _extract_action_and_reasoning(response)
+            except Exception as exc:
+                transcript.append(
+                    "Action generation failed:\n"
+                    f"`{type(exc).__name__}: {exc}`"
+                )
+                yield (
+                    _render_board(env),
+                    "\n".join(transcript),
+                    "Status: action generation error",
+                )
+                return
+
+            agent_type, agent_model = _agent_metadata(config, current_player)
+            transcript.append(f"Chosen action: `{action}`")
+            if agent_type == "llm":
+                transcript.append("Reasoning trace:")
+                transcript.append(f"> {reasoning}")
+
+            if action not in legal_actions:
+                loggers[current_player].log_illegal_move(
+                    game_name=game_name,
+                    episode=round_number,
+                    turn=turn,
+                    agent_id=current_player,
+                    illegal_action=action,
+                    reason="Illegal action",
+                    board_state=observation["state_string"],
+                )
+                transcript.append(f"Illegal move detected: `{action}`")
+                yield (
+                    _render_board(env),
+                    "\n".join(transcript),
+                    "Status: illegal move",
+                )
+                return
+
+            loggers[current_player].log_move(
+                game_name=game_name,
+                episode=round_number,
                 turn=turn,
-                agent_id=current_player,
-                illegal_action=action,
-                reason="Illegal action",
+                action=action,
+                reasoning=reasoning,
+                opponent=_opponent_label(config, current_player),
+                generation_time=0.0,
+                agent_type=agent_type,
+                agent_model=agent_model,
+                seed=round_seed,
                 board_state=observation["state_string"],
             )
-            transcript.append(f"Illegal move detected: `{action}`")
-            yield (
-                _render_board(env),
-                "\n".join(transcript),
-                "Status: illegal move",
+
+            observations, step_rewards, terminated, truncated, _ = env.step(
+                {current_player: action}
             )
-            return
+            rewards.update(step_rewards)
+            turn += 1
+            last_board = _render_board(env)
 
-        loggers[current_player].log_move(
-            game_name=GAME_NAME,
-            episode=1,
-            turn=turn,
-            action=action,
-            reasoning=reasoning,
-            opponent=_opponent_label(config, current_player),
-            generation_time=0.0,
-            agent_type=agent_type,
-            agent_model=agent_model,
-            seed=seed,
-            board_state=observation["state_string"],
+            yield (
+                last_board,
+                "\n".join(transcript),
+                _format_status(
+                    round_number,
+                    rounds,
+                    turn,
+                    rewards,
+                    terminated or truncated,
+                    summary_counts,
+                ),
+            )
+
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+
+        final_status = "truncated" if truncated else "terminated"
+        player0_outcome = _classify_player_outcome(
+            rewards, player_id=0, num_players=num_players, truncated=truncated
         )
-
-        observations, step_rewards, terminated, truncated, _ = env.step(
-            {current_player: action}
+        summary_counts[player0_outcome] += 1
+        round_summary = (
+            f"Round {round_number}: {player0_outcome.upper()} "
+            f"(status={final_status}, rewards={rewards})"
         )
-        rewards.update(step_rewards)
-        turn += 1
+        round_summaries.append(round_summary)
+        transcript.append(f"\n## {round_summary}")
 
+        for player_id, reward in rewards.items():
+            player_outcome = _classify_player_outcome(
+                rewards,
+                player_id=player_id,
+                num_players=num_players,
+                truncated=truncated,
+            )
+            loggers[player_id].log_rewards(game_name, round_number, reward)
+            loggers[player_id].log_game_result(
+                game_name=game_name,
+                episode=round_number,
+                status=f"{final_status}_{player_outcome}",
+                reward=reward,
+                opponent=_opponent_label(config, player_id),
+            )
+
+        transcript.append("\nRound summaries so far:")
+        transcript.extend(f"- {summary}" for summary in round_summaries)
         yield (
-            _render_board(env),
+            last_board,
             "\n".join(transcript),
-            _format_status(turn, rewards, terminated or truncated),
+            _format_status(
+                round_number, rounds, turn, rewards, True, summary_counts
+            ),
         )
 
-        if delay_seconds > 0:
-            time.sleep(delay_seconds)
-
-    final_status = "truncated" if truncated else "terminated"
-    transcript.append(f"\n## Game {final_status}")
-    transcript.append(
-        f"Final rewards: Player 0 = `{rewards.get(0, 0)}`, "
-        f"Player 1 = `{rewards.get(1, 0)}`"
-    )
-
-    for player_id, reward in rewards.items():
-        loggers[player_id].log_rewards(GAME_NAME, 1, reward)
-        loggers[player_id].log_game_result(
-            game_name=GAME_NAME,
-            episode=1,
-            status=final_status,
-            reward=reward,
-            opponent=_opponent_label(config, player_id),
-        )
-
+    transcript.append("\n# Final summary")
+    transcript.append(f"Player 0 outcomes: `{summary_counts}`")
     yield (
-        _render_board(env),
+        last_board,
         "\n".join(transcript),
-        _format_status(turn, rewards, True),
+        _format_status(
+            rounds,
+            rounds,
+            0,
+            {0: 0, 1: "done" if num_players > 1 else "n/a"},
+            True,
+            summary_counts,
+        ),
     )
 
 
@@ -356,14 +495,14 @@ def build_app() -> Any:
             "python3 -m pip install gradio"
         ) from exc
 
-    with gr.Blocks(title="Live Connect Four LLM Match") as demo:
+    with gr.Blocks(title="Live Game LLM Match") as demo:
         gr.Markdown(
-            "# Live Connect Four: LLM vs Random\n"
-            "Choose a provider/model preset, paste that provider's API key "
-            "locally, click the button, and watch the match stream turn by "
-            "turn. The key is placed in this Python process as the selected "
-            "provider's API-key environment variable; it is not written to "
-            "result logs."
+            "# Live Game Match: LLM vs Random\n"
+            "Choose a game and provider/model preset, paste that provider's "
+            "API key locally, choose how many rounds to run, and watch the "
+            "match stream turn by turn. The key is placed in this Python "
+            "process as the selected provider's API-key environment variable; "
+            "it is not written to result logs."
         )
 
         with gr.Row():
@@ -377,9 +516,15 @@ def build_app() -> Any:
                 choices=list(MODEL_PRESETS.keys()),
                 value=DEFAULT_PRESET,
             )
+            game_preset = gr.Dropdown(
+                label="Game",
+                choices=list(GAME_PRESETS.keys()),
+                value="Connect Four",
+            )
 
         with gr.Row():
             seed = gr.Number(label="Seed", value=42, precision=0)
+            rounds = gr.Number(label="Rounds", value=1, precision=0)
             delay_seconds = gr.Slider(
                 label="Delay between turns",
                 minimum=0.0,
@@ -387,7 +532,7 @@ def build_app() -> Any:
                 value=0.5,
                 step=0.25,
             )
-            max_turns = gr.Number(label="Max turns", value=42, precision=0)
+            max_turns = gr.Number(label="Max turns per round", value=80, precision=0)
 
         run_button = gr.Button("Run selected model vs Random", variant="primary")
 
@@ -399,7 +544,15 @@ def build_app() -> Any:
 
         run_button.click(
             fn=run_live_match,
-            inputs=[api_key, seed, model_preset, delay_seconds, max_turns],
+            inputs=[
+                api_key,
+                seed,
+                game_preset,
+                model_preset,
+                rounds,
+                delay_seconds,
+                max_turns,
+            ],
             outputs=[board, transcript, status],
         )
 

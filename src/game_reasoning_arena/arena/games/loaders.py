@@ -55,6 +55,32 @@ class ConnectFourLoader(GameLoader):
 
 
 @registry.register(
+    name="gin_rummy",
+    module_path="game_reasoning_arena.arena.games.loaders",
+    class_name="GinRummyLoader",
+    environment_path="game_reasoning_arena.arena.envs.generic_text_env.GenericTextEnv",
+    display_name="Gin Rummy"
+)
+class GinRummyLoader(GameLoader):
+    @staticmethod
+    def load():
+        return pyspiel.load_game("gin_rummy")
+
+
+@registry.register(
+    name="solitaire",
+    module_path="game_reasoning_arena.arena.games.loaders",
+    class_name="SolitaireLoader",
+    environment_path="game_reasoning_arena.arena.envs.generic_text_env.GenericTextEnv",
+    display_name="Solitaire"
+)
+class SolitaireLoader(GameLoader):
+    @staticmethod
+    def load():
+        return pyspiel.load_game("solitaire")
+
+
+@registry.register(
     name="kuhn_poker",
     module_path="game_reasoning_arena.arena.games.loaders",
     class_name="KuhnPokerLoader",

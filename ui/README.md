@@ -44,7 +44,7 @@ From the project root directory:
 python app.py
 ```
 
-For the lightweight live Connect Four LLM vs Random match viewer:
+For the lightweight live game LLM vs Random match viewer:
 
 ```bash
 python3 live_connect_four_app.py
@@ -61,6 +61,11 @@ password field. OpenRouter Gemini presets use an OpenRouter key; Google Gemini
 presets use a Google Gemini/AI Studio key. The key is used only in the running
 Python process as the selected provider's API-key environment variable; it is
 not written to result logs.
+
+The live viewer supports Connect Four, Tic-Tac-Toe, Gin Rummy, and OpenSpiel
+Solitaire. Set `Rounds` to run multiple episodes. The turn log shows player 0's
+win/loss/draw outcome per round, and the SQLite `game_results.status` values
+include the outcome suffix (for example `terminated_win`).
 
 Note: Cursor API keys are shown in the live viewer for clarity, but they are
 not playable model keys for this per-turn game loop. Cursor's public API is
