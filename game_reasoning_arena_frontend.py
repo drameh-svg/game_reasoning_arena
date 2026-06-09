@@ -107,7 +107,7 @@ MODEL_CHOICES = {
     },
 }
 
-AGENT_TYPES = ["llm", "openspiel_bot", "random"]
+AGENT_TYPES = ["llm", "strong_bot", "openspiel_bot", "random"]
 
 APP_CSS = """
 body, .gradio-container {
@@ -176,6 +176,8 @@ def _agent_config(agent_type: str, model_label: str) -> Dict[str, str]:
     if agent_type == "llm":
         model_name, _ = _resolve_model(model_label)
         return {"type": "llm", "model": model_name}
+    if agent_type == "strong_bot":
+        return {"type": "strong_bot", "model": "search_heuristic"}
     if agent_type == "openspiel_bot":
         return {"type": "openspiel_bot", "model": "uniform_random"}
     return {"type": "random"}
@@ -184,7 +186,7 @@ def _agent_config(agent_type: str, model_label: str) -> Dict[str, str]:
 def _agent_metadata(config: Dict[str, Any], player_id: int) -> Tuple[str, str]:
     agent = config["agents"].get(f"player_{player_id}", {"type": "unknown"})
     agent_type = agent.get("type", "unknown")
-    model = agent.get("model", "None") if agent_type in {"llm", "openspiel_bot"} else "None"
+    model = agent.get("model", "None") if agent_type in {"llm", "strong_bot", "openspiel_bot"} else "None"
     return agent_type, model
 
 
@@ -194,7 +196,7 @@ def _opponent_label(config: Dict[str, Any], player_id: int) -> str:
         if key == f"player_{player_id}":
             continue
         agent_type = agent.get("type", "unknown")
-        model = agent.get("model", "None") if agent_type in {"llm", "openspiel_bot"} else "None"
+        model = agent.get("model", "None") if agent_type in {"llm", "strong_bot", "openspiel_bot"} else "None"
         labels.append(f"{agent_type}_{model.replace('-', '_')}")
     return ", ".join(labels) if labels else "single_player"
 
@@ -261,6 +263,254 @@ def _build_config(
     }
 
 
+def _safe_clone_apply(state: Any, action: int) -> Any:
+    """Clone an OpenSpiel state and apply one action."""
+    next_state = state.clone()
+    next_state.apply_action(action)
+    return next_state
+
+
+def _connect_four_window_score(
+    window: List[str],
+    player_symbol: str,
+    opponent_symbol: str,
+) -> int:
+    """Score one four-cell Connect Four window for a simple heuristic."""
+    player_count = window.count(player_symbol)
+    opponent_count = window.count(opponent_symbol)
+    empty_count = window.count(".")
+
+    if player_count == 4:
+        return 100000
+    if opponent_count == 4:
+        return -100000
+    if player_count == 3 and empty_count == 1:
+        return 100
+    if player_count == 2 and empty_count == 2:
+        return 10
+    if opponent_count == 3 and empty_count == 1:
+        return -120
+    if opponent_count == 2 and empty_count == 2:
+        return -8
+    return 0
+
+
+def _connect_four_heuristic(state: Any, player_id: int) -> float:
+    """Evaluate non-terminal Connect Four states from one player's view.
+
+    OpenSpiel already provides exact rewards at terminal states. For depth
+    cutoffs, this heuristic prefers center control and potential four-in-a-row
+    windows while penalizing opponent threats.
+    """
+    if state.is_terminal():
+        return state.player_reward(player_id) * 100000
+
+    raw = state.observation_string(player_id)
+    cells = [char for char in raw if char in ("x", "o", ".")]
+    if len(cells) != 42:
+        return 0
+
+    board = [cells[i:i + 7] for i in range(0, 42, 7)]
+    player_symbol = "x" if player_id == 0 else "o"
+    opponent_symbol = "o" if player_id == 0 else "x"
+    score = 0
+
+    center_column = [row[3] for row in board]
+    score += center_column.count(player_symbol) * 6
+    score -= center_column.count(opponent_symbol) * 6
+
+    # Horizontal windows.
+    for row in range(6):
+        for col in range(4):
+            score += _connect_four_window_score(
+                board[row][col:col + 4],
+                player_symbol,
+                opponent_symbol,
+            )
+
+    # Vertical windows.
+    for col in range(7):
+        for row in range(3):
+            window = [board[row + i][col] for i in range(4)]
+            score += _connect_four_window_score(
+                window,
+                player_symbol,
+                opponent_symbol,
+            )
+
+    # Down-right diagonal windows.
+    for row in range(3):
+        for col in range(4):
+            window = [board[row + i][col + i] for i in range(4)]
+            score += _connect_four_window_score(
+                window,
+                player_symbol,
+                opponent_symbol,
+            )
+
+    # Up-right diagonal windows.
+    for row in range(3, 6):
+        for col in range(4):
+            window = [board[row - i][col + i] for i in range(4)]
+            score += _connect_four_window_score(
+                window,
+                player_symbol,
+                opponent_symbol,
+            )
+
+    return score
+
+
+def _state_heuristic(game_name: str, state: Any, player_id: int) -> float:
+    """Dispatch game-specific heuristic values for search cutoffs."""
+    if state.is_terminal():
+        return state.player_reward(player_id) * 100000
+    if game_name == "connect_four":
+        return _connect_four_heuristic(state, player_id)
+    return 0
+
+
+def _alpha_beta_value(
+    game_name: str,
+    state: Any,
+    root_player: int,
+    depth: int,
+    alpha: float,
+    beta: float,
+) -> float:
+    """Minimax/alpha-beta value for deterministic turn-based OpenSpiel games."""
+    if state.is_terminal() or depth <= 0:
+        return _state_heuristic(game_name, state, root_player)
+
+    current_player = state.current_player()
+    if current_player < 0:
+        return _state_heuristic(game_name, state, root_player)
+
+    legal_actions = state.legal_actions(current_player)
+    if not legal_actions:
+        return _state_heuristic(game_name, state, root_player)
+
+    maximizing = current_player == root_player
+    if maximizing:
+        value = float("-inf")
+        for action in legal_actions:
+            child = _safe_clone_apply(state, action)
+            value = max(
+                value,
+                _alpha_beta_value(
+                    game_name,
+                    child,
+                    root_player,
+                    depth - 1,
+                    alpha,
+                    beta,
+                ),
+            )
+            alpha = max(alpha, value)
+            if alpha >= beta:
+                break
+        return value
+
+    value = float("inf")
+    for action in legal_actions:
+        child = _safe_clone_apply(state, action)
+        value = min(
+            value,
+            _alpha_beta_value(
+                game_name,
+                child,
+                root_player,
+                depth - 1,
+                alpha,
+                beta,
+            ),
+        )
+        beta = min(beta, value)
+        if alpha >= beta:
+            break
+    return value
+
+
+def _find_immediate_tactical_action(
+    state: Any,
+    player_id: int,
+    legal_actions: List[int],
+) -> Optional[int]:
+    """Return a winning move, or a blocking move against opponent win."""
+    # First, win immediately if possible.
+    for action in legal_actions:
+        child = _safe_clone_apply(state, action)
+        if child.is_terminal() and child.player_reward(player_id) > 0:
+            return action
+
+    # Then, block any opponent action that would immediately win.
+    opponent = 1 - player_id
+    for opponent_action in state.legal_actions(opponent):
+        child = _safe_clone_apply(state, opponent_action)
+        if child.is_terminal() and child.player_reward(opponent) > 0:
+            return opponent_action if opponent_action in legal_actions else None
+
+    return None
+
+
+def _strong_bot_action(
+    game_name: str,
+    state: Any,
+    player_id: int,
+    legal_actions: List[int],
+) -> Tuple[int, str]:
+    """Choose a stronger game-specific action for Tic-Tac-Toe/Connect Four."""
+    if not legal_actions:
+        return 0, "No legal actions were available."
+
+    if game_name not in {"tic_tac_toe", "connect_four"}:
+        return (
+            legal_actions[0],
+            "Strong bot is only implemented for Tic-Tac-Toe and Connect Four; "
+            "used the first legal action as a deterministic fallback.",
+        )
+
+    tactical_action = _find_immediate_tactical_action(
+        state,
+        player_id,
+        legal_actions,
+    )
+    if tactical_action is not None:
+        return tactical_action, "Strong bot found an immediate win or block."
+
+    if game_name == "tic_tac_toe":
+        search_depth = 9
+    else:
+        search_depth = 5
+
+    preferred_order = legal_actions
+    if game_name == "connect_four":
+        center_order = [3, 2, 4, 1, 5, 0, 6]
+        preferred_order = [a for a in center_order if a in legal_actions]
+
+    best_action = preferred_order[0]
+    best_value = float("-inf")
+    for action in preferred_order:
+        child = _safe_clone_apply(state, action)
+        value = _alpha_beta_value(
+            game_name,
+            child,
+            player_id,
+            search_depth - 1,
+            float("-inf"),
+            float("inf"),
+        )
+        if value > best_value:
+            best_value = value
+            best_action = action
+
+    return (
+        best_action,
+        f"Strong bot used alpha-beta search depth {search_depth} "
+        f"and selected action {best_action} with value {best_value:.1f}.",
+    )
+
+
 def _initialize_frontend_agents(
     config: Dict[str, Any],
     game_name: str,
@@ -292,6 +542,8 @@ def _initialize_frontend_agents(
                 player_id,
                 seed,
             )
+        elif agent_type == "strong_bot":
+            player_to_agent[player_id] = None
         elif agent_type == "random":
             player_to_agent[player_id] = RandomAgent(seed=seed)
         else:
@@ -607,7 +859,7 @@ def run_experiment_live(
         "num_episodes": num_episodes,
         "seed": seed,
         "agents": config["agents"],
-        "methodology": "Game Reasoning Arena live frontend using OpenSpiel registry, LLMAgent/RandomAgent/OpenSpiel bots, and SQLiteLogger",
+        "methodology": "Game Reasoning Arena live frontend using OpenSpiel registry, LLMAgent/RandomAgent/OpenSpiel bots/strong search bots, and SQLiteLogger",
     }
     move_records: List[Dict[str, Any]] = []
     result_records: List[Dict[str, Any]] = []
@@ -670,7 +922,14 @@ def run_experiment_live(
                 observation = observations[player_id]
                 legal_actions = observation["legal_actions"]
                 agent_type, agent_model = _agent_metadata(config, player_id)
-                if agent_type == "openspiel_bot":
+                if agent_type == "strong_bot":
+                    action, reasoning = _strong_bot_action(
+                        game_name,
+                        env.state,
+                        player_id,
+                        legal_actions,
+                    )
+                elif agent_type == "openspiel_bot":
                     action = player_to_agent[player_id].step(env.state)
                     reasoning = "OpenSpiel uniform random bot selected the action."
                 else:
@@ -682,7 +941,7 @@ def run_experiment_live(
                 )
                 transcript.append(f"Legal actions: `{legal_actions}`")
                 transcript.append(f"Chosen action: `{action}`")
-                if agent_type in {"llm", "openspiel_bot"}:
+                if agent_type in {"llm", "strong_bot", "openspiel_bot"}:
                     transcript.append(f"Reasoning: {reasoning}")
 
                 if action not in legal_actions:
@@ -849,7 +1108,7 @@ def build_app() -> Any:
                     value="Remote / OpenRouter Gemini 2.5 Flash",
                     label="Player 0 model",
                 )
-                player1_type = gr.Dropdown(AGENT_TYPES, value="openspiel_bot", label="Player 1 type")
+                player1_type = gr.Dropdown(AGENT_TYPES, value="strong_bot", label="Player 1 type")
                 player1_model = gr.Dropdown(
                     list(MODEL_CHOICES.keys()),
                     value="Remote / Groq Llama 3.1 8B Instant",
