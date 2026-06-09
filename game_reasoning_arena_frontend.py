@@ -107,7 +107,7 @@ MODEL_CHOICES = {
     },
 }
 
-AGENT_TYPES = ["llm", "random"]
+AGENT_TYPES = ["llm", "openspiel_bot", "random"]
 
 APP_CSS = """
 body, .gradio-container {
@@ -176,13 +176,15 @@ def _agent_config(agent_type: str, model_label: str) -> Dict[str, str]:
     if agent_type == "llm":
         model_name, _ = _resolve_model(model_label)
         return {"type": "llm", "model": model_name}
+    if agent_type == "openspiel_bot":
+        return {"type": "openspiel_bot", "model": "uniform_random"}
     return {"type": "random"}
 
 
 def _agent_metadata(config: Dict[str, Any], player_id: int) -> Tuple[str, str]:
     agent = config["agents"].get(f"player_{player_id}", {"type": "unknown"})
     agent_type = agent.get("type", "unknown")
-    model = agent.get("model", "None") if agent_type == "llm" else "None"
+    model = agent.get("model", "None") if agent_type in {"llm", "openspiel_bot"} else "None"
     return agent_type, model
 
 
@@ -192,7 +194,7 @@ def _opponent_label(config: Dict[str, Any], player_id: int) -> str:
         if key == f"player_{player_id}":
             continue
         agent_type = agent.get("type", "unknown")
-        model = agent.get("model", "None") if agent_type == "llm" else "None"
+        model = agent.get("model", "None") if agent_type in {"llm", "openspiel_bot"} else "None"
         labels.append(f"{agent_type}_{model.replace('-', '_')}")
     return ", ".join(labels) if labels else "single_player"
 
@@ -257,6 +259,45 @@ def _build_config(
         "tensorboard_logging": False,
         "run_post_processing": False,
     }
+
+
+def _initialize_frontend_agents(
+    config: Dict[str, Any],
+    game_name: str,
+    seed: int,
+    num_players: int,
+) -> Dict[int, Any]:
+    """Create player agents for the live frontend.
+
+    This mirrors the repository policy mapping for `llm` and `random`, while
+    adding an explicit OpenSpiel bot path. OpenSpiel bots need access to the
+    current OpenSpiel state (`env.state`), so the live loop handles them
+    directly with `bot.step(env.state)`.
+    """
+    import pyspiel
+    from game_reasoning_arena.arena.agents.llm_agent import LLMAgent
+    from game_reasoning_arena.arena.agents.random_agent import RandomAgent
+
+    player_to_agent = {}
+    for player_id in range(num_players):
+        agent_config = config["agents"][f"player_{player_id}"]
+        agent_type = agent_config["type"]
+        if agent_type == "llm":
+            player_to_agent[player_id] = LLMAgent(
+                model_name=agent_config["model"],
+                game_name=game_name,
+            )
+        elif agent_type == "openspiel_bot":
+            player_to_agent[player_id] = pyspiel.make_uniform_random_bot(
+                player_id,
+                seed,
+            )
+        elif agent_type == "random":
+            player_to_agent[player_id] = RandomAgent(seed=seed)
+        else:
+            raise ValueError(f"Unsupported frontend agent type: {agent_type}")
+
+    return player_to_agent
 
 
 def _set_api_keys(
@@ -502,7 +543,6 @@ def run_experiment_live(
         from game_reasoning_arena.arena.games.registry import registry
         from game_reasoning_arena.arena.utils.loggers import SQLiteLogger
         from game_reasoning_arena.arena.utils.seeding import set_seed
-        from game_reasoning_arena.arena.agents.policy_manager import initialize_policies
         from game_reasoning_arena.backends import initialize_llm_registry
     except ImportError as exc:
         yield (
@@ -567,7 +607,7 @@ def run_experiment_live(
         "num_episodes": num_episodes,
         "seed": seed,
         "agents": config["agents"],
-        "methodology": "Game Reasoning Arena live frontend using OpenSpiel registry, policy_manager, LLMAgent/RandomAgent, and SQLiteLogger",
+        "methodology": "Game Reasoning Arena live frontend using OpenSpiel registry, LLMAgent/RandomAgent/OpenSpiel bots, and SQLiteLogger",
     }
     move_records: List[Dict[str, Any]] = []
     result_records: List[Dict[str, Any]] = []
@@ -588,10 +628,12 @@ def run_experiment_live(
         episode_seed = seed + episode_index
         set_seed(episode_seed)
 
-        policies = initialize_policies(config, game_name, episode_seed)
-        player_to_agent = {
-            player_id: policy for player_id, policy in enumerate(policies.values())
-        }
+        player_to_agent = _initialize_frontend_agents(
+            config,
+            game_name,
+            episode_seed,
+            num_players,
+        )
         env = registry.make_env(game_name, config)
         observations, _ = env.reset(seed=episode_seed)
         rewards = {player_id: 0.0 for player_id in range(num_players)}
@@ -627,16 +669,20 @@ def run_experiment_live(
             for player_id in active_players:
                 observation = observations[player_id]
                 legal_actions = observation["legal_actions"]
-                response = player_to_agent[player_id](observation)
-                action, reasoning = _extract_action_and_reasoning(response)
-
                 agent_type, agent_model = _agent_metadata(config, player_id)
+                if agent_type == "openspiel_bot":
+                    action = player_to_agent[player_id].step(env.state)
+                    reasoning = "OpenSpiel uniform random bot selected the action."
+                else:
+                    response = player_to_agent[player_id](observation)
+                    action, reasoning = _extract_action_and_reasoning(response)
+
                 transcript.append(
                     f"\nEpisode {episode}, Turn {turn}, Player {player_id}"
                 )
                 transcript.append(f"Legal actions: `{legal_actions}`")
                 transcript.append(f"Chosen action: `{action}`")
-                if agent_type == "llm":
+                if agent_type in {"llm", "openspiel_bot"}:
                     transcript.append(f"Reasoning: {reasoning}")
 
                 if action not in legal_actions:
@@ -803,7 +849,7 @@ def build_app() -> Any:
                     value="Remote / OpenRouter Gemini 2.5 Flash",
                     label="Player 0 model",
                 )
-                player1_type = gr.Dropdown(AGENT_TYPES, value="random", label="Player 1 type")
+                player1_type = gr.Dropdown(AGENT_TYPES, value="openspiel_bot", label="Player 1 type")
                 player1_model = gr.Dropdown(
                     list(MODEL_CHOICES.keys()),
                     value="Remote / Groq Llama 3.1 8B Instant",
