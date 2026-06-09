@@ -143,6 +143,63 @@ body, .gradio-container {
   font-family: "SFMono-Regular", "Cascadia Code", "Roboto Mono", Menlo, monospace;
   line-height: 1.35;
 }
+.board-title {
+  margin: 0 0 0.75rem 0;
+  font-size: 1.05rem;
+  font-weight: 800;
+}
+.ttt-board {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(64px, 88px));
+  gap: 0;
+  width: max-content;
+  border: 2px solid #000;
+  background: #000;
+}
+.ttt-cell {
+  width: 82px;
+  height: 82px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+  border: 1px solid #000;
+  font-size: 2.1rem;
+  font-weight: 900;
+}
+.connect4-board {
+  display: grid;
+  grid-template-columns: repeat(7, 46px);
+  gap: 7px;
+  width: max-content;
+  padding: 12px;
+  border: 2px solid #000;
+  background: #f7f7f7;
+}
+.connect4-cell {
+  width: 46px;
+  height: 46px;
+  border: 2px solid #000;
+  border-radius: 50%;
+  background: #fff;
+}
+.piece-x {
+  background: #111;
+}
+.piece-o {
+  background: #fff;
+  box-shadow: inset 0 0 0 9px #d1d5db;
+}
+.column-labels {
+  display: grid;
+  grid-template-columns: repeat(7, 46px);
+  gap: 7px;
+  width: max-content;
+  margin: 0 0 0.35rem 14px;
+  font-size: 0.75rem;
+  font-weight: 800;
+  text-align: center;
+}
 .gra-log {
   max-height: 560px;
   overflow-y: auto;
@@ -211,7 +268,66 @@ def _extract_action_and_reasoning(response: Any) -> Tuple[int, str]:
     return int(response), "None"
 
 
+def _symbols_from_observation(env: Any, player_id: int, expected_count: int) -> List[str]:
+    """Extract x/o/dot board symbols from an OpenSpiel observation string."""
+    raw = env.state.observation_string(player_id)
+    symbols = [char for char in raw if char in ("x", "o", ".")]
+    return symbols if len(symbols) == expected_count else []
+
+
+def _render_tic_tac_toe_html(env: Any, player_id: int) -> str:
+    """Render Tic-Tac-Toe as a 3x3 visual grid with position labels."""
+    symbols = _symbols_from_observation(env, player_id, 9)
+    if not symbols:
+        return ""
+    cells = []
+    for idx, symbol in enumerate(symbols):
+        display = "" if symbol == "." else symbol.upper()
+        hint = idx if symbol == "." else ""
+        cells.append(
+            "<div class='ttt-cell'>"
+            f"<span>{display}</span><small>{hint}</small>"
+            "</div>"
+        )
+    return (
+        "<div class='board-title'>Tic-Tac-Toe board</div>"
+        "<div class='ttt-board'>"
+        + "".join(cells)
+        + "</div>"
+        "<p><strong>Empty cell labels show legal board indices.</strong></p>"
+    )
+
+
+def _render_connect_four_html(env: Any, player_id: int) -> str:
+    """Render Connect Four as a 6x7 disc board with column labels."""
+    symbols = _symbols_from_observation(env, player_id, 42)
+    if not symbols:
+        return ""
+    labels = "".join(f"<div>{idx}</div>" for idx in range(7))
+    cells = []
+    for symbol in symbols:
+        piece_class = "piece-x" if symbol == "x" else "piece-o" if symbol == "o" else ""
+        cells.append(f"<div class='connect4-cell {piece_class}'></div>")
+    return (
+        "<div class='board-title'>Connect Four board</div>"
+        f"<div class='column-labels'>{labels}</div>"
+        "<div class='connect4-board'>"
+        + "".join(cells)
+        + "</div>"
+        "<p><strong>Column labels are action numbers.</strong></p>"
+    )
+
+
 def _render_board(env: Any, player_id: int = 0) -> str:
+    game_name = getattr(env, "game_name", "")
+    if game_name == "tic_tac_toe":
+        html = _render_tic_tac_toe_html(env, player_id)
+        if html:
+            return html
+    if game_name == "connect_four":
+        html = _render_connect_four_html(env, player_id)
+        if html:
+            return html
     try:
         rendered = env.render_board(player_id)
     except Exception:
@@ -581,6 +697,47 @@ def _set_api_key_for_config(api_key: str, config: Dict[str, Any]) -> None:
 
     for env_var in _required_env_vars_for_config(config):
         os.environ[env_var] = pasted_key
+
+
+def _key_shape_warning(env_var: str, api_key: str) -> Optional[str]:
+    """Return a warning when a pasted key does not resemble its provider."""
+    key = (api_key or "").strip()
+    if not key:
+        return None
+    if env_var == "OPENROUTER_API_KEY" and not key.startswith("sk-or-"):
+        return (
+            "The selected model uses OpenRouter, but the pasted key does not "
+            "look like an OpenRouter key. OpenRouter keys usually start with "
+            "`sk-or-`. If you have a Google Gemini key, select "
+            "`Remote / Google Gemini 2.5 Flash` instead."
+        )
+    if env_var == "GEMINI_API_KEY" and key.startswith("sk-or-"):
+        return (
+            "The selected model uses Google Gemini directly, but the pasted key "
+            "looks like an OpenRouter key. Select an OpenRouter model preset "
+            "instead, or paste a Google AI Studio/Gemini key."
+        )
+    if env_var == "GROQ_API_KEY" and not key.startswith("gsk_"):
+        return (
+            "The selected model uses Groq, but the pasted key does not look "
+            "like a Groq key. Groq keys usually start with `gsk_`."
+        )
+    return None
+
+
+def _validate_pasted_key_shape(config: Dict[str, Any], api_key: str) -> Optional[str]:
+    """Validate the single pasted key against selected LLM provider(s)."""
+    pasted_key = (api_key or "").strip()
+    if not pasted_key:
+        return None
+    warnings = [
+        warning
+        for env_var in _required_env_vars_for_config(config)
+        if (warning := _key_shape_warning(env_var, pasted_key))
+    ]
+    if warnings:
+        return "\n".join(warnings)
+    return None
 
 
 def _validate_keys_for_agents(config: Dict[str, Any]) -> Optional[str]:
@@ -1031,6 +1188,20 @@ def run_experiment_live(
     )
 
     _set_api_key_for_config(provider_api_key, config)
+
+    key_shape_warning = _validate_pasted_key_shape(config, provider_api_key)
+    if key_shape_warning:
+        yield (
+            "```text\nNo board yet.\n```",
+            key_shape_warning,
+            "Status: API key/provider mismatch",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        return
 
     missing_key_message = _validate_keys_for_agents(config)
     if missing_key_message:
