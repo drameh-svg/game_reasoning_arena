@@ -552,41 +552,126 @@ def _initialize_frontend_agents(
     return player_to_agent
 
 
-def _set_api_keys(
-    openai_key: str,
-    groq_key: str,
-    openrouter_key: str,
-    gemini_key: str,
-) -> None:
-    load_dotenv()
-    key_map = {
-        "OPENAI_API_KEY": openai_key,
-        "GROQ_API_KEY": groq_key,
-        "OPENROUTER_API_KEY": openrouter_key,
-        "GEMINI_API_KEY": gemini_key,
-    }
-    for env_var, value in key_map.items():
-        if value and value.strip():
-            os.environ[env_var] = value.strip()
-
-
-def _validate_keys_for_agents(config: Dict[str, Any]) -> Optional[str]:
-    missing = []
+def _required_env_vars_for_config(config: Dict[str, Any]) -> List[str]:
+    """Return provider API-key env vars needed by selected LLM agents."""
+    required = []
     for agent in config["agents"].values():
         if agent.get("type") != "llm":
             continue
+
         model_name = agent.get("model", "")
-        env_var = ""
         for preset in MODEL_CHOICES.values():
-            if preset["model"] == model_name:
-                env_var = preset["env_var"]
+            if preset["model"] == model_name and preset["env_var"]:
+                required.append(preset["env_var"])
                 break
-        if env_var and not os.getenv(env_var):
-            missing.append(env_var)
+
+    return sorted(set(required))
+
+
+def _set_api_key_for_config(api_key: str, config: Dict[str, Any]) -> None:
+    """Apply one pasted key to the provider env vars required by this run."""
+    load_dotenv()
+    pasted_key = (api_key or "").strip()
+    if not pasted_key:
+        return
+
+    for env_var in _required_env_vars_for_config(config):
+        os.environ[env_var] = pasted_key
+
+
+def _validate_keys_for_agents(config: Dict[str, Any]) -> Optional[str]:
+    missing = [
+        env_var
+        for env_var in _required_env_vars_for_config(config)
+        if not os.getenv(env_var)
+    ]
 
     if missing:
         return "Missing API key(s): " + ", ".join(sorted(set(missing)))
     return None
+
+
+def _list_previous_frontend_runs(limit: int = 12) -> str:
+    """Return Markdown listing recent CSV/JSON exports from this frontend."""
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    csv_files = sorted(
+        EXPORT_DIR.glob("*.csv"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not csv_files:
+        return (
+            "### Previous runs\n"
+            "No frontend exports yet. Completed runs will appear here."
+        )
+
+    lines = ["### Previous runs"]
+    for csv_path in csv_files[:limit]:
+        json_path = csv_path.with_suffix(".json")
+        timestamp = datetime.fromtimestamp(csv_path.stat().st_mtime).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        json_marker = "JSON available" if json_path.exists() else "CSV only"
+        lines.append(f"- `{csv_path.name}`  \n  {timestamp} · {json_marker}")
+
+    if len(csv_files) > limit:
+        lines.append(f"\n_Showing latest {limit} of {len(csv_files)} exports._")
+
+    return "\n".join(lines)
+
+
+def _model_dropdown_update(agent_type: str) -> Any:
+    """Only show a model dropdown when the selected player type is `llm`."""
+    import gradio as gr
+
+    return gr.update(visible=(agent_type == "llm"))
+
+
+def _player_type_ui_updates(changed_type: str, other_type: str) -> Tuple[Any, Any]:
+    """Update one model dropdown and the single API-key field visibility."""
+    import gradio as gr
+
+    model_update = gr.update(visible=(changed_type == "llm"))
+    api_key_update = gr.update(visible=(changed_type == "llm" or other_type == "llm"))
+    return model_update, api_key_update
+
+
+def _show_setup_panel() -> Any:
+    """Reopen the setup panel for another run."""
+    import gradio as gr
+
+    return gr.update(visible=True)
+
+
+def _prepare_setup_panel_for_run(
+    run_name: str,
+    player0_type: str,
+    player0_model_label: str,
+    player1_type: str,
+    player1_model_label: str,
+    provider_api_key: str,
+) -> Any:
+    """Hide setup only when the minimum required run inputs are present."""
+    import gradio as gr
+
+    if not (run_name or "").strip():
+        return gr.update(visible=True)
+
+    temp_config = {
+        "agents": {
+            "player_0": _agent_config(player0_type, player0_model_label),
+            "player_1": _agent_config(player1_type, player1_model_label),
+        }
+    }
+    required_env_vars = _required_env_vars_for_config(temp_config)
+    if required_env_vars:
+        load_dotenv()
+        pasted_key = (provider_api_key or "").strip()
+        has_existing_key = any(os.getenv(env_var) for env_var in required_env_vars)
+        if not pasted_key and not has_existing_key:
+            return gr.update(visible=True)
+
+    return gr.update(visible=False)
 
 
 # ---------------------------------------------------------------------------
@@ -768,10 +853,7 @@ def run_experiment_live(
     player0_model_label: str,
     player1_type: str,
     player1_model_label: str,
-    openai_key: str,
-    groq_key: str,
-    openrouter_key: str,
-    gemini_key: str,
+    provider_api_key: str,
     max_turns: int,
     delay_seconds: float,
 ) -> Generator[Tuple[str, str, str, Any, Any, Any, Any, Any], None, None]:
@@ -788,8 +870,6 @@ def run_experiment_live(
             None,
         )
         return
-
-    _set_api_keys(openai_key, groq_key, openrouter_key, gemini_key)
 
     try:
         from game_reasoning_arena.arena.games.registry import registry
@@ -826,6 +906,8 @@ def run_experiment_live(
         player1_type=player1_type,
         player1_model_label=player1_model_label,
     )
+
+    _set_api_key_for_config(provider_api_key, config)
 
     missing_key_message = _validate_keys_for_agents(config)
     if missing_key_message:
@@ -1079,70 +1161,104 @@ def build_app() -> Any:
         )
 
         with gr.Row():
-            with gr.Column(scale=1, elem_classes=["gra-panel"]):
-                run_name = gr.Textbox(
-                    label="Run name",
-                    placeholder="example_connect_four_gemini_10eps",
-                )
-                game = gr.Dropdown(
-                    choices=list(GAME_CHOICES.keys()),
-                    value="Tic-Tac-Toe",
-                    label="OpenSpiel game",
-                )
-                num_episodes = gr.Number(label="Episodes", value=1, precision=0)
-                seed = gr.Number(label="Seed", value=42, precision=0)
-                max_turns = gr.Number(label="Max turns per episode", value=80, precision=0)
-                delay_seconds = gr.Slider(
-                    label="Live delay between turns",
-                    minimum=0,
-                    maximum=3,
-                    value=0.25,
-                    step=0.25,
+            with gr.Column(scale=1, min_width=260, elem_classes=["gra-panel"]):
+                previous_runs = gr.Markdown(value=_list_previous_frontend_runs())
+                refresh_runs = gr.Button("Refresh previous runs", elem_classes=["gra-secondary"])
+                new_run = gr.Button("New experiment", elem_classes=["gra-secondary"])
+
+            with gr.Column(scale=4):
+                with gr.Column(visible=True, elem_classes=["gra-panel"]) as setup_panel:
+                    with gr.Row():
+                        run_name = gr.Textbox(
+                            label="Run name",
+                            placeholder="example_connect_four_gemini_10eps",
+                        )
+                        provider_api_key = gr.Textbox(
+                            label="API key for selected LLM provider",
+                            type="password",
+                            placeholder="Paste one key only. Hidden if no LLM is selected.",
+                        )
+
+                    with gr.Row():
+                        game = gr.Dropdown(
+                            choices=list(GAME_CHOICES.keys()),
+                            value="Tic-Tac-Toe",
+                            label="OpenSpiel game",
+                        )
+                        num_episodes = gr.Number(label="Episodes", value=1, precision=0)
+                        seed = gr.Number(label="Seed", value=42, precision=0)
+                        max_turns = gr.Number(label="Max turns per episode", value=80, precision=0)
+
+                    with gr.Row():
+                        player0_type = gr.Dropdown(AGENT_TYPES, value="llm", label="Player 0 type")
+                        player0_model = gr.Dropdown(
+                            list(MODEL_CHOICES.keys()),
+                            value="Remote / OpenRouter Gemini 2.5 Flash",
+                            label="Player 0 model",
+                            visible=True,
+                        )
+                        player1_type = gr.Dropdown(AGENT_TYPES, value="strong_bot", label="Player 1 type")
+                        player1_model = gr.Dropdown(
+                            list(MODEL_CHOICES.keys()),
+                            value="Remote / Groq Llama 3.1 8B Instant",
+                            label="Player 1 model",
+                            visible=False,
+                        )
+
+                    delay_seconds = gr.Slider(
+                        label="Live delay between turns",
+                        minimum=0,
+                        maximum=3,
+                        value=0.25,
+                        step=0.25,
+                    )
+
+                    run_button = gr.Button("Run experiment", variant="primary", elem_classes=["gra-button"])
+
+                with gr.Row():
+                    board = gr.Markdown("```text\nNo game running.\n```", elem_classes=["gra-board"])
+                    status = gr.Markdown("Status: idle", elem_classes=["gra-panel"])
+
+                transcript = gr.Markdown(
+                    "Reasoning traces and episode logs will appear here.",
+                    elem_classes=["gra-panel", "gra-log"],
                 )
 
-            with gr.Column(scale=1, elem_classes=["gra-panel"]):
-                gr.Markdown("### Agents")
-                player0_type = gr.Dropdown(AGENT_TYPES, value="llm", label="Player 0 type")
-                player0_model = gr.Dropdown(
-                    list(MODEL_CHOICES.keys()),
-                    value="Remote / OpenRouter Gemini 2.5 Flash",
-                    label="Player 0 model",
-                )
-                player1_type = gr.Dropdown(AGENT_TYPES, value="strong_bot", label="Player 1 type")
-                player1_model = gr.Dropdown(
-                    list(MODEL_CHOICES.keys()),
-                    value="Remote / Groq Llama 3.1 8B Instant",
-                    label="Player 1 model",
-                )
+                with gr.Row():
+                    csv_file = gr.File(label="Download CSV")
+                    json_file = gr.File(label="Download JSON")
 
-            with gr.Column(scale=1, elem_classes=["gra-panel"]):
-                gr.Markdown("### API keys")
-                openai_key = gr.Textbox(label="OpenAI API key", type="password")
-                groq_key = gr.Textbox(label="Groq API key", type="password")
-                openrouter_key = gr.Textbox(label="OpenRouter API key", type="password")
-                gemini_key = gr.Textbox(label="Google Gemini API key", type="password")
+                with gr.Row():
+                    reward_plot = gr.HTML(label="Rewards by episode")
+                    outcome_plot = gr.HTML(label="Player 0 outcomes")
+                    turns_plot = gr.HTML(label="Turns per episode")
 
-        run_button = gr.Button("Run experiment", variant="primary", elem_classes=["gra-button"])
-
-        with gr.Row():
-            board = gr.Markdown("```text\nNo game running.\n```", elem_classes=["gra-board"])
-            status = gr.Markdown("Status: idle", elem_classes=["gra-panel"])
-
-        transcript = gr.Markdown(
-            "Reasoning traces and episode logs will appear here.",
-            elem_classes=["gra-panel", "gra-log"],
+        refresh_runs.click(fn=_list_previous_frontend_runs, outputs=previous_runs)
+        new_run.click(fn=_show_setup_panel, outputs=setup_panel)
+        player0_type.change(
+            fn=_player_type_ui_updates,
+            inputs=[player0_type, player1_type],
+            outputs=[player0_model, provider_api_key],
+        )
+        player1_type.change(
+            fn=_player_type_ui_updates,
+            inputs=[player1_type, player0_type],
+            outputs=[player1_model, provider_api_key],
         )
 
-        with gr.Row():
-            csv_file = gr.File(label="Download CSV")
-            json_file = gr.File(label="Download JSON")
-
-        with gr.Row():
-            reward_plot = gr.HTML(label="Rewards by episode")
-            outcome_plot = gr.HTML(label="Player 0 outcomes")
-            turns_plot = gr.HTML(label="Turns per episode")
-
-        run_button.click(
+        run_event = run_button.click(
+            fn=_prepare_setup_panel_for_run,
+            inputs=[
+                run_name,
+                player0_type,
+                player0_model,
+                player1_type,
+                player1_model,
+                provider_api_key,
+            ],
+            outputs=setup_panel,
+        )
+        run_event.then(
             fn=run_experiment_live,
             inputs=[
                 run_name,
@@ -1153,10 +1269,7 @@ def build_app() -> Any:
                 player0_model,
                 player1_type,
                 player1_model,
-                openai_key,
-                groq_key,
-                openrouter_key,
-                gemini_key,
+                provider_api_key,
                 max_turns,
                 delay_seconds,
             ],
@@ -1170,7 +1283,7 @@ def build_app() -> Any:
                 outcome_plot,
                 turns_plot,
             ],
-        )
+        ).then(fn=_list_previous_frontend_runs, outputs=previous_runs)
 
     return demo
 
