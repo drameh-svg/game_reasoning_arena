@@ -30,6 +30,10 @@ from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 
+MAX_LLM_ATTEMPTS = 3
+RETRY_DELAYS_SECONDS = [2, 5]
+
+
 # ---------------------------------------------------------------------------
 # Repository path setup
 # ---------------------------------------------------------------------------
@@ -591,6 +595,109 @@ def _validate_keys_for_agents(config: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _classify_provider_error(exc: Exception) -> str:
+    """Map raw provider exceptions into a short research-friendly category."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "rate" in text or "quota" in text or "429" in text:
+        return "rate_limit_or_quota"
+    if "503" in text or "unavailable" in text or "overload" in text or "demand" in text:
+        return "provider_unavailable"
+    if "api key" in text or "auth" in text or "unauthorized" in text or "401" in text:
+        return "authentication"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "model" in text and ("not found" in text or "does not exist" in text):
+        return "model_unavailable"
+    return "provider_error"
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """Return True for failures that often succeed after a short retry."""
+    return _classify_provider_error(exc) in {
+        "rate_limit_or_quota",
+        "provider_unavailable",
+        "timeout",
+    }
+
+
+def _llm_action_with_retries(
+    agent: Any,
+    observation: Dict[str, Any],
+    episode: int,
+    turn: int,
+    player_id: int,
+    agent_model: str,
+) -> Tuple[int, str, List[Dict[str, Any]]]:
+    """Call an LLM agent with bounded retries and return retry metadata."""
+    failures = []
+    for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
+        try:
+            response = agent(observation)
+            action, reasoning = _extract_action_and_reasoning(response)
+            if failures:
+                reasoning = (
+                    f"{reasoning}\n\n"
+                    f"[Recovered after {len(failures)} failed attempt(s).]"
+                )
+            return action, reasoning, failures
+        except Exception as exc:
+            category = _classify_provider_error(exc)
+            failure = {
+                "episode": episode,
+                "turn": turn,
+                "player_id": player_id,
+                "agent_model": agent_model,
+                "attempt": attempt,
+                "error_type": category,
+                "error_message": f"{type(exc).__name__}: {exc}",
+                "timestamp": datetime.now().isoformat(),
+            }
+            failures.append(failure)
+            if attempt >= MAX_LLM_ATTEMPTS or not _is_retryable_error(exc):
+                raise RuntimeError(json.dumps(failures, ensure_ascii=False)) from exc
+
+            time.sleep(RETRY_DELAYS_SECONDS[min(attempt - 1, len(RETRY_DELAYS_SECONDS) - 1)])
+
+    raise RuntimeError(json.dumps(failures, ensure_ascii=False))
+
+
+def _preflight_llm_models(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Validate selected LLM models with a tiny test call before gameplay."""
+    from game_reasoning_arena.backends import generate_response
+
+    checked_models = []
+    failures = []
+    for player_key, agent in config["agents"].items():
+        if agent.get("type") != "llm":
+            continue
+        model_name = agent.get("model", "")
+        if model_name in checked_models:
+            continue
+        checked_models.append(model_name)
+        try:
+            response = generate_response(
+                model_name=model_name,
+                prompt=(
+                    "Reply with exactly this JSON and no extra text: "
+                    "{\"reasoning\":\"preflight ok\",\"action\":0}"
+                ),
+                max_tokens=30,
+                temperature=0.0,
+            )
+            if not response or not str(response).strip():
+                raise RuntimeError("Provider returned an empty preflight response")
+        except Exception as exc:
+            failures.append({
+                "player": player_key,
+                "agent_model": model_name,
+                "error_type": _classify_provider_error(exc),
+                "error_message": f"{type(exc).__name__}: {exc}",
+                "timestamp": datetime.now().isoformat(),
+            })
+
+    return failures
+
+
 def _list_previous_frontend_runs(limit: int = 12) -> str:
     """Return Markdown listing recent CSV/JSON exports from this frontend."""
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -683,6 +790,7 @@ def _write_exports(
     metadata: Dict[str, Any],
     move_records: List[Dict[str, Any]],
     result_records: List[Dict[str, Any]],
+    failure_records: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[str, str]:
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     safe_name = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in run_name)
@@ -696,6 +804,7 @@ def _write_exports(
         "metadata": metadata,
         "moves": move_records,
         "game_results": result_records,
+        "failures": failure_records or [],
     }
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
@@ -717,12 +826,26 @@ def _write_exports(
         "seed",
         "board_state",
         "legal_actions",
+        "error_type",
+        "error_message",
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for record in move_records:
             writer.writerow({field: record.get(field, "") for field in fieldnames})
+        for failure in failure_records or []:
+            writer.writerow({
+                "run_name": run_name,
+                "game_name": metadata.get("game_name", ""),
+                "episode": failure.get("episode", ""),
+                "turn": failure.get("turn", ""),
+                "player_id": failure.get("player_id", ""),
+                "agent_model": failure.get("agent_model", ""),
+                "timestamp": failure.get("timestamp", ""),
+                "error_type": failure.get("error_type", ""),
+                "error_message": failure.get("error_message", ""),
+            })
 
     return str(csv_path), str(json_path)
 
@@ -945,6 +1068,7 @@ def run_experiment_live(
     }
     move_records: List[Dict[str, Any]] = []
     result_records: List[Dict[str, Any]] = []
+    failure_records: List[Dict[str, Any]] = []
     transcript = [
         "# Game Reasoning Arena Live Run",
         f"- Run: `{run_name}`",
@@ -954,6 +1078,36 @@ def run_experiment_live(
         f"- Agents: `{config['agents']}`",
         "",
     ]
+
+    if any(agent.get("type") == "llm" for agent in config["agents"].values()):
+        transcript.append("\n## Preflight model/API validation")
+        preflight_failures = _preflight_llm_models(config)
+        if preflight_failures:
+            failure_records.extend(preflight_failures)
+            metadata["completed_at"] = datetime.utcnow().isoformat()
+            metadata["preflight_status"] = "failed"
+            csv_path, json_path = _write_exports(
+                run_name,
+                metadata,
+                move_records,
+                result_records,
+                failure_records,
+            )
+            failure_text = json.dumps(preflight_failures, indent=2, ensure_ascii=False)
+            transcript.append("Preflight failed before gameplay started.")
+            transcript.append(f"```json\n{failure_text}\n```")
+            yield (
+                "```text\nNo board yet.\n```",
+                "\n".join(transcript),
+                "Status: preflight failed",
+                csv_path,
+                json_path,
+                None,
+                None,
+                None,
+            )
+            return
+        transcript.append("Preflight passed.")
 
     last_board = "```text\nNo board yet.\n```"
 
@@ -1015,23 +1169,60 @@ def run_experiment_live(
                     elif agent_type == "openspiel_bot":
                         action = player_to_agent[player_id].step(env.state)
                         reasoning = "OpenSpiel uniform random bot selected the action."
+                    elif agent_type == "llm":
+                        action, reasoning, retry_failures = _llm_action_with_retries(
+                            player_to_agent[player_id],
+                            observation,
+                            episode,
+                            turn,
+                            player_id,
+                            agent_model,
+                        )
+                        failure_records.extend(retry_failures)
                     else:
                         response = player_to_agent[player_id](observation)
                         action, reasoning = _extract_action_and_reasoning(response)
                 except Exception as exc:
+                    parsed_failures = []
+                    try:
+                        parsed_failures = json.loads(str(exc))
+                    except Exception:
+                        parsed_failures = [{
+                            "episode": episode,
+                            "turn": turn,
+                            "player_id": player_id,
+                            "agent_model": agent_model,
+                            "error_type": _classify_provider_error(exc),
+                            "error_message": f"{type(exc).__name__}: {exc}",
+                            "timestamp": datetime.now().isoformat(),
+                        }]
+                    failure_records.extend(parsed_failures)
+                    metadata["completed_at"] = datetime.utcnow().isoformat()
+                    metadata["failure_status"] = "action_generation_error"
+                    csv_path, json_path = _write_exports(
+                        run_name,
+                        metadata,
+                        move_records,
+                        result_records,
+                        failure_records,
+                    )
                     error_message = (
                         f"Action generation failed in episode {episode}, "
                         f"turn {turn}, player {player_id} "
                         f"({agent_type}/{agent_model}): "
-                        f"{type(exc).__name__}: {exc}"
+                        f"{parsed_failures[-1].get('error_type')}: "
+                        f"{parsed_failures[-1].get('error_message')}"
                     )
                     transcript.append(f"\n## Error\n{error_message}")
+                    transcript.append(
+                        "Failure details were written to the CSV/JSON export."
+                    )
                     yield (
                         last_board,
                         "\n".join(transcript),
                         f"Status: action generation error\n{error_message}",
-                        None,
-                        None,
+                        csv_path,
+                        json_path,
                         None,
                         None,
                         None,
@@ -1100,17 +1291,38 @@ def run_experiment_live(
             try:
                 observations, step_rewards, terminated, truncated, _ = env.step(action_dict)
             except Exception as exc:
+                failure_records.append({
+                    "episode": episode,
+                    "turn": turn,
+                    "player_id": "",
+                    "agent_model": "",
+                    "error_type": "environment_step_error",
+                    "error_message": f"{type(exc).__name__}: {exc}",
+                    "timestamp": datetime.now().isoformat(),
+                })
+                metadata["completed_at"] = datetime.utcnow().isoformat()
+                metadata["failure_status"] = "environment_step_error"
+                csv_path, json_path = _write_exports(
+                    run_name,
+                    metadata,
+                    move_records,
+                    result_records,
+                    failure_records,
+                )
                 error_message = (
                     f"OpenSpiel step failed in episode {episode}, turn {turn}: "
                     f"{type(exc).__name__}: {exc}"
                 )
                 transcript.append(f"\n## Error\n{error_message}")
+                transcript.append(
+                    "Failure details were written to the CSV/JSON export."
+                )
                 yield (
                     last_board,
                     "\n".join(transcript),
                     f"Status: environment step error\n{error_message}",
-                    None,
-                    None,
+                    csv_path,
+                    json_path,
                     None,
                     None,
                     None,
@@ -1160,7 +1372,13 @@ def run_experiment_live(
             })
 
     metadata["completed_at"] = datetime.utcnow().isoformat()
-    csv_path, json_path = _write_exports(run_name, metadata, move_records, result_records)
+    csv_path, json_path = _write_exports(
+        run_name,
+        metadata,
+        move_records,
+        result_records,
+        failure_records,
+    )
     reward_fig, outcome_fig, turns_fig = _make_charts(result_records, move_records)
     transcript.append("\n## Outputs")
     transcript.append(f"- CSV: `{csv_path}`")
