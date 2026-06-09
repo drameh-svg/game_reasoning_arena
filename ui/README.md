@@ -72,6 +72,13 @@ Keep `Save/export game data` enabled to create a downloadable ZIP file with:
 - JSON metadata, round summaries, full turn records, and transcript
 - CSV turn-level records for spreadsheet analysis
 
+For a transparent research-oriented explanation of the code path, data flow,
+logging, exports, reproducibility steps, and limitations, see:
+
+```text
+docs/arkadium_testing_arena_research_notes.md
+```
+
 Note: Cursor API keys are shown in the live viewer for clarity, but they are
 not playable model keys for this per-turn game loop. Cursor's public API is
 for Cursor Cloud Agent/admin operations, not chat-completions responses.
