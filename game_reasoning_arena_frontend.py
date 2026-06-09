@@ -114,6 +114,22 @@ MODEL_CHOICES = {
 
 AGENT_TYPES = ["llm", "strong_bot", "openspiel_bot", "random"]
 
+EVAL_GAME_CHOICES = {
+    "Tic-Tac-Toe": "tic_tac_toe",
+    "Connect Four": "connect_four",
+}
+
+FAILURE_MECHANISMS = [
+    "Visual Processing",
+    "Physical Reasoning",
+    "Social Reasoning",
+    "World Model Learning",
+    "Memory",
+    "Spatial Temporal",
+    "Long Horizon Planning",
+    "Strategic Decision Making",
+]
+
 APP_CSS = """
 body, .gradio-container {
   background: #ffffff !important;
@@ -1008,6 +1024,147 @@ def _write_exports(
     return str(csv_path), str(json_path)
 
 
+def _utc_now() -> str:
+    """Return an ISO UTC timestamp with a Z suffix for export files."""
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _empty_failure_counts() -> Dict[str, int]:
+    """Return all supported failure mechanisms initialized to zero."""
+    return {mechanism: 0 for mechanism in FAILURE_MECHANISMS}
+
+
+def _summarize_human_eval(
+    turns: List[Dict[str, Any]],
+    result: str,
+) -> Dict[str, Any]:
+    """Build the summary object in the user-requested JSON schema."""
+    failure_counts = _empty_failure_counts()
+    first_failure_turn = None
+    for turn in turns:
+        mechanisms = turn.get("failure_mechanism") or []
+        if mechanisms and first_failure_turn is None:
+            first_failure_turn = turn["turn"]
+        for mechanism in mechanisms:
+            if mechanism in failure_counts:
+                failure_counts[mechanism] += 1
+
+    legal_moves = sum(1 for turn in turns if turn.get("move_is_legal") is True)
+    illegal_moves = sum(1 for turn in turns if turn.get("move_is_legal") is False)
+    optimal_moves = sum(1 for turn in turns if turn.get("move_is_optimal") is True)
+    suboptimal_moves = sum(1 for turn in turns if turn.get("move_is_optimal") is False)
+
+    return {
+        "result": result,
+        "total_turns": len(turns),
+        "legal_moves": legal_moves,
+        "illegal_moves": illegal_moves,
+        "optimal_moves": optimal_moves,
+        "suboptimal_moves": suboptimal_moves,
+        "failure_counts": failure_counts,
+        "first_failure_turn": first_failure_turn,
+    }
+
+
+def _write_human_eval_exports(state: Dict[str, Any]) -> Tuple[str, str]:
+    """Write JSON and CSV files for the human move-evaluation workflow."""
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    experiment_id = state["experiment_id"]
+    safe_name = "".join(
+        ch if ch.isalnum() or ch in "-_." else "_"
+        for ch in experiment_id
+    ).strip("._-") or "human_eval"
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    base = EXPORT_DIR / f"{safe_name}_{timestamp}"
+    json_path = base.with_suffix(".json")
+    csv_path = base.with_suffix(".csv")
+
+    turns = state.get("turns", [])
+    result = state.get("result", "incomplete")
+    payload = {
+        "game": state["game_name"],
+        "episode": state["episode_id"],
+        "started_at": state["started_at"],
+        "turns": [
+            {
+                "turn": turn["turn"],
+                "timestamp": turn["timestamp"],
+                "move_is_legal": turn["move_is_legal"],
+                "move_is_optimal": turn["move_is_optimal"],
+                "failure_mechanism": turn["failure_mechanism"],
+            }
+            for turn in turns
+        ],
+        "summary": _summarize_human_eval(turns, result),
+    }
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    fieldnames = [
+        "experiment_id",
+        "timestamp",
+        "game_name",
+        "episode_id",
+        "turn_number",
+        "model_name",
+        "provider",
+        "board_state",
+        "legal_actions",
+        "chosen_action",
+        "raw_model_response",
+        "reasoning_trace",
+        "human_legality_label",
+        "move_is_legal",
+        "move_is_optimal",
+        "failure_mechanism",
+        "evaluator_notes",
+        "prompt_version",
+        "stage_history",
+        "result",
+        "total_turns",
+        "legal_moves",
+        "illegal_moves",
+        "optimal_moves",
+        "suboptimal_moves",
+        "first_failure_turn",
+    ]
+    summary = payload["summary"]
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for turn in turns:
+            writer.writerow({
+                "experiment_id": experiment_id,
+                "timestamp": turn["timestamp"],
+                "game_name": state["game_name"],
+                "episode_id": state["episode_id"],
+                "turn_number": turn["turn"],
+                "model_name": state["model_name"],
+                "provider": state["provider"],
+                "board_state": turn.get("board_state", ""),
+                "legal_actions": json.dumps(turn.get("legal_actions", [])),
+                "chosen_action": turn.get("chosen_action"),
+                "raw_model_response": turn.get("raw_model_response", ""),
+                "reasoning_trace": turn.get("reasoning_trace", ""),
+                "human_legality_label": turn.get("human_legality_label"),
+                "move_is_legal": turn.get("move_is_legal"),
+                "move_is_optimal": turn.get("move_is_optimal"),
+                "failure_mechanism": json.dumps(turn.get("failure_mechanism")),
+                "evaluator_notes": turn.get("evaluator_notes", ""),
+                "prompt_version": turn.get("prompt_version", ""),
+                "stage_history": json.dumps(turn.get("stage_history", [])),
+                "result": summary["result"],
+                "total_turns": summary["total_turns"],
+                "legal_moves": summary["legal_moves"],
+                "illegal_moves": summary["illegal_moves"],
+                "optimal_moves": summary["optimal_moves"],
+                "suboptimal_moves": summary["suboptimal_moves"],
+                "first_failure_turn": summary["first_failure_turn"],
+            })
+
+    return str(json_path), str(csv_path)
+
+
 def _collect_sqlite_run_records(
     run_name: str,
     loggers: Dict[int, Any],
@@ -1226,6 +1383,410 @@ def _make_charts(result_records: List[Dict[str, Any]], move_records: List[Dict[s
     )
 
     return reward_chart, outcome_chart, turns_chart
+
+
+# ---------------------------------------------------------------------------
+# Human-in-the-loop move evaluation flow
+# ---------------------------------------------------------------------------
+
+def _eval_stage_updates(stage: str) -> Tuple[Any, Any, Any]:
+    """Return visibility updates for legality/optimality/attribution panels."""
+    import gradio as gr
+
+    return (
+        gr.update(visible=(stage == "legality")),
+        gr.update(visible=(stage == "optimality")),
+        gr.update(visible=stage in {"attribution_illegal", "attribution_suboptimal"}),
+    )
+
+
+def _provider_from_model_label(model_label: str) -> str:
+    if model_label.startswith("Remote / OpenRouter"):
+        return "openrouter"
+    if model_label.startswith("Remote / Google Gemini"):
+        return "google_gemini"
+    if model_label.startswith("Remote / OpenAI"):
+        return "openai"
+    if model_label.startswith("Remote / Groq"):
+        return "groq"
+    if model_label.startswith("Local /"):
+        return "local"
+    return "unknown"
+
+
+def _human_eval_status(state: Dict[str, Any]) -> str:
+    stage = state.get("stage", "not_started")
+    labels = {
+        "legality": "Legality check",
+        "optimality": "Optimality judgment",
+        "attribution_illegal": "Failure attribution for illegal move",
+        "attribution_suboptimal": "Failure attribution for suboptimal move",
+        "complete": "Completed",
+        "error": "Error",
+    }
+    return (
+        f"**Stage:** {labels.get(stage, stage)}  \n"
+        f"**Turn:** {state.get('turn_number', 0)}  \n"
+        f"**Saved labels:** {len(state.get('turns', []))}"
+    )
+
+
+def _pending_move_markdown(state: Dict[str, Any]) -> str:
+    pending = state.get("pending")
+    if not pending:
+        return "No pending model move."
+    return (
+        "### Current model move\n"
+        f"**Chosen action:** `{pending['chosen_action']}`  \n"
+        f"**Legal actions:** `{pending['legal_actions']}`  \n\n"
+        "**Model reasoning**\n\n"
+        f"{pending['reasoning_trace']}"
+    )
+
+
+def _finalize_human_eval(state: Dict[str, Any], result: str) -> Tuple[str, str]:
+    if result == "complete" and state.get("env") is not None:
+        reward = state["env"].state.player_reward(0)
+        if reward > 0:
+            result = "win"
+        elif reward < 0:
+            result = "loss"
+        else:
+            result = "draw"
+    state["result"] = result
+    json_path, csv_path = _write_human_eval_exports(state)
+    state["json_path"] = json_path
+    state["csv_path"] = csv_path
+    return json_path, csv_path
+
+
+def _auto_play_until_model_turn(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Let the opponent move until it is player 0/model turn or game ends."""
+    env = state["env"]
+    observations = state["observations"]
+    opponent_agent = state["opponent_agent"]
+
+    while not env.state.is_terminal() and env.state.current_player() != 0:
+        current_player = env.state.current_player()
+        legal_actions = observations[current_player]["legal_actions"]
+        action, _reasoning = _strong_bot_action(
+            state["game_name"],
+            env.state,
+            current_player,
+            legal_actions,
+        )
+        observations, _rewards, _terminated, _truncated, _ = env.step({current_player: action})
+        state["observations"] = observations
+
+    return state
+
+
+def _prepare_next_human_eval_turn(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Advance to the next model move and store it as `state['pending']`."""
+    state = _auto_play_until_model_turn(state)
+    env = state["env"]
+    if env.state.is_terminal():
+        _finalize_human_eval(state, "complete")
+        state["stage"] = "complete"
+        state["pending"] = None
+        return state
+
+    if state["turn_number"] >= state["max_turns"]:
+        _finalize_human_eval(state, "max_turns")
+        state["stage"] = "complete"
+        state["pending"] = None
+        return state
+
+    observation = state["observations"][0]
+    action, reasoning, failures = _llm_action_with_retries(
+        state["model_agent"],
+        observation,
+        episode=state["episode_id"],
+        turn=state["turn_number"] + 1,
+        player_id=0,
+        agent_model=state["model_name"],
+    )
+    if failures:
+        state.setdefault("provider_failures", []).extend(failures)
+
+    state["turn_number"] += 1
+    state["pending"] = {
+        "turn": state["turn_number"],
+        "timestamp": _utc_now(),
+        "board_state": observation.get("state_string", ""),
+        "legal_actions": observation.get("legal_actions", []),
+        "chosen_action": action,
+        "raw_model_response": json.dumps({"action": action, "reasoning": reasoning}, ensure_ascii=False),
+        "reasoning_trace": reasoning,
+        "prompt_version": "game_reasoning_arena_frontend_v1",
+        "stage_history": ["legality"],
+    }
+    state["stage"] = "legality"
+    return state
+
+
+def start_human_evaluation(
+    experiment_id: str,
+    game_label: str,
+    model_label: str,
+    provider_api_key: str,
+    seed: int,
+    max_turns: int,
+) -> Tuple[str, str, str, Dict[str, Any], Any, Any, Any, Any, Any]:
+    """Start a human-labeled game for Tic-Tac-Toe or Connect Four."""
+    if not (experiment_id or "").strip():
+        empty_state = {"stage": "error", "turns": []}
+        legality, optimality, attribution = _eval_stage_updates("error")
+        return (
+            "```text\nNo board yet.\n```",
+            "Name the experiment before starting.",
+            "Status: missing experiment id",
+            empty_state,
+            legality,
+            optimality,
+            attribution,
+            None,
+            None,
+        )
+
+    game_name = EVAL_GAME_CHOICES.get(game_label, "connect_four")
+    model_name, env_var = _resolve_model(model_label)
+    config = {
+        "agents": {
+            "player_0": {"type": "llm", "model": model_name},
+            "player_1": {"type": "strong_bot", "model": "search_heuristic"},
+        }
+    }
+    _set_api_key_for_config(provider_api_key, config)
+    key_shape_warning = _validate_pasted_key_shape(config, provider_api_key)
+    if key_shape_warning:
+        state = {"stage": "error", "turns": []}
+        legality, optimality, attribution = _eval_stage_updates("error")
+        return (
+            "```text\nNo board yet.\n```",
+            key_shape_warning,
+            "Status: API key/provider mismatch",
+            state,
+            legality,
+            optimality,
+            attribution,
+            None,
+            None,
+        )
+
+    missing_key = _validate_keys_for_agents(config)
+    if missing_key:
+        state = {"stage": "error", "turns": []}
+        legality, optimality, attribution = _eval_stage_updates("error")
+        return (
+            "```text\nNo board yet.\n```",
+            missing_key,
+            "Status: missing API key",
+            state,
+            legality,
+            optimality,
+            attribution,
+            None,
+            None,
+        )
+
+    from game_reasoning_arena.arena.games.registry import registry
+    from game_reasoning_arena.arena.agents.llm_agent import LLMAgent
+    from game_reasoning_arena.backends import initialize_llm_registry
+
+    initialize_llm_registry()
+    env_config = _build_config(
+        game_name=game_name,
+        seed=int(seed),
+        num_players=2,
+        player0_type="llm",
+        player0_model_label=model_label,
+        player1_type="strong_bot",
+        player1_model_label=model_label,
+    )
+    env = registry.make_env(game_name, env_config)
+    observations, _ = env.reset(seed=int(seed))
+    state = {
+        "experiment_id": experiment_id.strip(),
+        "game_name": game_name,
+        "episode_id": 1,
+        "started_at": _utc_now(),
+        "model_name": model_name,
+        "provider": _provider_from_model_label(model_label),
+        "env": env,
+        "observations": observations,
+        "model_agent": LLMAgent(model_name=model_name, game_name=game_name),
+        "opponent_agent": "strong_bot",
+        "turn_number": 0,
+        "max_turns": int(max_turns),
+        "turns": [],
+        "stage": "legality",
+        "pending": None,
+        "result": "incomplete",
+    }
+    try:
+        state = _prepare_next_human_eval_turn(state)
+    except Exception as exc:
+        state["stage"] = "error"
+        legality, optimality, attribution = _eval_stage_updates("error")
+        return (
+            _render_board(state["env"], 0),
+            f"Model move generation failed: {type(exc).__name__}: {exc}",
+            "Status: model error",
+            state,
+            legality,
+            optimality,
+            attribution,
+            None,
+            None,
+        )
+
+    legality, optimality, attribution = _eval_stage_updates(state["stage"])
+    return (
+        _render_board(state["env"], 0),
+        _pending_move_markdown(state),
+        _human_eval_status(state),
+        state,
+        legality,
+        optimality,
+        attribution,
+        None,
+        None,
+    )
+
+
+def _save_pending_human_eval(
+    state: Dict[str, Any],
+    move_is_legal: bool,
+    move_is_optimal: Optional[bool],
+    failure_mechanism: Optional[List[str]],
+    notes: str,
+) -> Dict[str, Any]:
+    pending = state["pending"]
+    pending["stage_history"].append("completed_turn")
+    state["turns"].append({
+        **pending,
+        "human_legality_label": "Legal" if move_is_legal else "Illegal",
+        "move_is_legal": move_is_legal,
+        "move_is_optimal": move_is_optimal,
+        "failure_mechanism": failure_mechanism,
+        "evaluator_notes": notes or "",
+    })
+
+    env = state["env"]
+    action = pending["chosen_action"]
+    if action in pending["legal_actions"]:
+        observations, _rewards, _terminated, _truncated, _ = env.step({0: action})
+        state["observations"] = observations
+    else:
+        _finalize_human_eval(state, "illegal_move_unapplied")
+        state["stage"] = "complete"
+        state["pending"] = None
+        return state
+
+    try:
+        state = _prepare_next_human_eval_turn(state)
+    except Exception as exc:
+        state["stage"] = "error"
+        state["error"] = f"{type(exc).__name__}: {exc}"
+    return state
+
+
+def mark_move_legal(state: Dict[str, Any]) -> Tuple[str, str, str, Dict[str, Any], Any, Any, Any, Any, Any]:
+    state["pending"]["stage_history"].append("marked_legal")
+    state["stage"] = "optimality"
+    legality, optimality, attribution = _eval_stage_updates(state["stage"])
+    return (
+        _render_board(state["env"], 0),
+        _pending_move_markdown(state),
+        _human_eval_status(state),
+        state,
+        legality,
+        optimality,
+        attribution,
+        state.get("json_path"),
+        state.get("csv_path"),
+    )
+
+
+def mark_move_illegal(state: Dict[str, Any]) -> Tuple[str, str, str, Dict[str, Any], Any, Any, Any, Any, Any]:
+    state["pending"]["stage_history"].append("marked_illegal")
+    state["stage"] = "attribution_illegal"
+    legality, optimality, attribution = _eval_stage_updates(state["stage"])
+    return (
+        _render_board(state["env"], 0),
+        _pending_move_markdown(state),
+        _human_eval_status(state),
+        state,
+        legality,
+        optimality,
+        attribution,
+        state.get("json_path"),
+        state.get("csv_path"),
+    )
+
+
+def mark_move_optimal(state: Dict[str, Any]) -> Tuple[str, str, str, Dict[str, Any], Any, Any, Any, Any, Any]:
+    state["pending"]["stage_history"].append("marked_optimal")
+    state = _save_pending_human_eval(state, True, True, None, "")
+    legality, optimality, attribution = _eval_stage_updates(state["stage"])
+    return (
+        _render_board(state["env"], 0) if state.get("env") else "```text\nComplete\n```",
+        _pending_move_markdown(state) if state.get("pending") else "Game complete. Download JSON/CSV below.",
+        _human_eval_status(state),
+        state,
+        legality,
+        optimality,
+        attribution,
+        state.get("json_path"),
+        state.get("csv_path"),
+    )
+
+
+def mark_move_suboptimal(state: Dict[str, Any]) -> Tuple[str, str, str, Dict[str, Any], Any, Any, Any, Any, Any]:
+    state["pending"]["stage_history"].append("marked_suboptimal")
+    state["stage"] = "attribution_suboptimal"
+    legality, optimality, attribution = _eval_stage_updates(state["stage"])
+    return (
+        _render_board(state["env"], 0),
+        _pending_move_markdown(state),
+        _human_eval_status(state),
+        state,
+        legality,
+        optimality,
+        attribution,
+        state.get("json_path"),
+        state.get("csv_path"),
+    )
+
+
+def submit_failure_attribution(
+    mechanisms: List[str],
+    notes: str,
+    state: Dict[str, Any],
+) -> Tuple[str, str, str, Dict[str, Any], Any, Any, Any, Any, Any]:
+    stage = state.get("stage")
+    move_is_legal = stage != "attribution_illegal"
+    move_is_optimal = False if move_is_legal else None
+    state = _save_pending_human_eval(
+        state,
+        move_is_legal=move_is_legal,
+        move_is_optimal=move_is_optimal,
+        failure_mechanism=mechanisms or [],
+        notes=notes,
+    )
+    legality, optimality, attribution = _eval_stage_updates(state["stage"])
+    return (
+        _render_board(state["env"], 0) if state.get("env") else "```text\nComplete\n```",
+        _pending_move_markdown(state) if state.get("pending") else "Game complete. Download JSON/CSV below.",
+        _human_eval_status(state),
+        state,
+        legality,
+        optimality,
+        attribution,
+        state.get("json_path"),
+        state.get("csv_path"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1849,6 +2410,120 @@ def build_app() -> Any:
                 turns_plot,
             ],
         ).then(fn=_list_previous_frontend_runs, outputs=previous_runs)
+
+        gr.Markdown(
+            "## Human move evaluation mode\n"
+            "Use this section when the research task is to label each model "
+            "move manually. This mode is limited to Tic-Tac-Toe and Connect "
+            "Four and exports JSON/CSV in the requested evaluation schema.",
+            elem_classes=["gra-hero"],
+        )
+
+        human_eval_state = gr.State({})
+        with gr.Row():
+            with gr.Column(scale=1, elem_classes=["gra-panel"]):
+                eval_experiment_id = gr.Textbox(
+                    label="Experiment ID",
+                    placeholder="connect_four_gemini_episode_1",
+                )
+                eval_game = gr.Dropdown(
+                    choices=list(EVAL_GAME_CHOICES.keys()),
+                    value="Connect Four",
+                    label="Game",
+                )
+                eval_model = gr.Dropdown(
+                    list(MODEL_CHOICES.keys()),
+                    value="Remote / OpenRouter Gemini 2.5 Flash",
+                    label="Model",
+                )
+                eval_api_key = gr.Textbox(
+                    label="API key for selected model",
+                    type="password",
+                )
+                eval_seed = gr.Number(label="Seed", value=42, precision=0)
+                eval_max_turns = gr.Number(label="Max model turns", value=42, precision=0)
+                start_eval = gr.Button(
+                    "Start human evaluation",
+                    variant="primary",
+                    elem_classes=["gra-button"],
+                )
+
+            with gr.Column(scale=2):
+                eval_board = gr.HTML(
+                    value="<div class='gra-panel'>Start an evaluation to see the board.</div>",
+                    label="Current game state",
+                )
+                eval_move = gr.Markdown(
+                    value="Current model action and reasoning will appear here.",
+                    elem_classes=["gra-panel"],
+                )
+                eval_status = gr.Markdown(
+                    value="Status: waiting to start",
+                    elem_classes=["gra-panel"],
+                )
+
+                with gr.Group(visible=False) as legality_panel:
+                    gr.Markdown("### Stage 1 — Human legality judgment")
+                    legal_btn = gr.Button("Legal", elem_classes=["gra-secondary"])
+                    illegal_btn = gr.Button("Illegal", elem_classes=["gra-secondary"])
+
+                with gr.Group(visible=False) as optimality_panel:
+                    gr.Markdown("### Stage 2 — Human optimality judgment")
+                    optimal_btn = gr.Button("Optimal / competent", elem_classes=["gra-secondary"])
+                    suboptimal_btn = gr.Button("Suboptimal", elem_classes=["gra-secondary"])
+
+                with gr.Group(visible=False) as attribution_panel:
+                    gr.Markdown("### Stage 3 — Failure attribution")
+                    failure_checks = gr.CheckboxGroup(
+                        choices=FAILURE_MECHANISMS,
+                        label="Failure mechanism(s)",
+                    )
+                    evaluator_notes = gr.Textbox(
+                        label="Evaluator notes",
+                        lines=3,
+                    )
+                    save_failure_btn = gr.Button(
+                        "Save labels + next turn",
+                        variant="primary",
+                        elem_classes=["gra-button"],
+                    )
+
+                with gr.Row():
+                    eval_json = gr.File(label="Download evaluation JSON")
+                    eval_csv = gr.File(label="Download evaluation CSV")
+
+        eval_outputs = [
+            eval_board,
+            eval_move,
+            eval_status,
+            human_eval_state,
+            legality_panel,
+            optimality_panel,
+            attribution_panel,
+            eval_json,
+            eval_csv,
+        ]
+        start_eval.click(
+            fn=start_human_evaluation,
+            inputs=[
+                eval_experiment_id,
+                eval_game,
+                eval_model,
+                eval_api_key,
+                eval_seed,
+                eval_max_turns,
+            ],
+            outputs=eval_outputs,
+        )
+        legal_btn.click(fn=mark_move_legal, inputs=human_eval_state, outputs=eval_outputs)
+        illegal_btn.click(fn=mark_move_illegal, inputs=human_eval_state, outputs=eval_outputs)
+        optimal_btn.click(fn=mark_move_optimal, inputs=human_eval_state, outputs=eval_outputs)
+        suboptimal_btn.click(fn=mark_move_suboptimal, inputs=human_eval_state, outputs=eval_outputs)
+        save_failure_btn.click(
+            fn=submit_failure_attribution,
+            inputs=[failure_checks, evaluator_notes, human_eval_state],
+            outputs=eval_outputs,
+        )
 
     return demo
 
