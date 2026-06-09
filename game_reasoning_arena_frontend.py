@@ -23,6 +23,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import sqlite3
 import sys
 import time
 from datetime import datetime
@@ -1007,6 +1008,113 @@ def _write_exports(
     return str(csv_path), str(json_path)
 
 
+def _collect_sqlite_run_records(
+    run_name: str,
+    loggers: Dict[int, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Read persisted move/result rows back from SQLiteLogger databases.
+
+    This mirrors the original reasoning-trace workflow: once gameplay has
+    written SQLite rows, final frontend exports/charts read the persisted data
+    instead of trusting a separate in-memory data model.
+    """
+    move_records: List[Dict[str, Any]] = []
+    result_records: List[Dict[str, Any]] = []
+
+    for player_id, logger in loggers.items():
+        conn = sqlite3.connect(logger.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            moves = conn.execute(
+                """
+                SELECT game_name, episode, turn, action, reasoning, opponent,
+                       generation_time, agent_type, agent_model, timestamp,
+                       run_id, seed, board_state
+                FROM moves
+                WHERE run_id = ?
+                ORDER BY game_name, episode, turn, id
+                """,
+                (logger.run_id,),
+            ).fetchall()
+            for row in moves:
+                record = dict(row)
+                record["run_name"] = run_name
+                record["player_id"] = player_id
+                record.setdefault("legal_actions", "")
+                move_records.append(record)
+
+            results = conn.execute(
+                """
+                SELECT game_name, episode, status, reward, opponent, timestamp,
+                       run_id
+                FROM game_results
+                WHERE run_id = ?
+                ORDER BY game_name, episode, id
+                """,
+                (logger.run_id,),
+            ).fetchall()
+            for row in results:
+                record = dict(row)
+                record["run_name"] = run_name
+                record["player_id"] = player_id
+                result_records.append(record)
+        finally:
+            conn.close()
+
+    move_records.sort(
+        key=lambda r: (
+            r.get("game_name", ""),
+            int(r.get("episode", 0) or 0),
+            int(r.get("turn", 0) or 0),
+            int(r.get("player_id", 0) or 0),
+        )
+    )
+    result_records.sort(
+        key=lambda r: (
+            r.get("game_name", ""),
+            int(r.get("episode", 0) or 0),
+            int(r.get("player_id", 0) or 0),
+        )
+    )
+    return move_records, result_records
+
+
+def _format_reasoning_traces_from_moves(move_records: List[Dict[str, Any]]) -> str:
+    """Format SQLite `moves` rows like the original trace extractor."""
+    if not move_records:
+        return "### Reasoning traces\nNo persisted move rows found for this run."
+
+    lines = ["### Reasoning traces from SQLite `moves` table"]
+    trace_number = 1
+    for record in move_records:
+        reasoning = (record.get("reasoning") or "").strip()
+        if not reasoning or reasoning == "None":
+            continue
+
+        lines.extend([
+            "",
+            f"#### Trace {trace_number}",
+            f"- Game: `{record.get('game_name')}`",
+            f"- Episode: `{record.get('episode')}`, Turn: `{record.get('turn')}`",
+            f"- Agent: `{record.get('agent_type')} ({record.get('agent_model')})`",
+            f"- Action: `{record.get('action')}`",
+            "",
+            "**Board state at decision time**",
+            "```text",
+            str(record.get("board_state") or "[not available]"),
+            "```",
+            "",
+            "**Reasoning**",
+            str(reasoning),
+        ])
+        trace_number += 1
+
+    if trace_number == 1:
+        lines.append("No non-empty reasoning strings were found.")
+
+    return "\n".join(lines)
+
+
 def _scale_points(values: List[Tuple[int, float]], width: int, height: int) -> str:
     if not values:
         return ""
@@ -1136,13 +1244,14 @@ def run_experiment_live(
     provider_api_key: str,
     max_turns: int,
     delay_seconds: float,
-) -> Generator[Tuple[str, str, str, Any, Any, Any, Any, Any], None, None]:
+) -> Generator[Tuple[str, str, str, str, Any, Any, Any, Any, Any], None, None]:
     """Run an original-methodology Game Reasoning Arena experiment live."""
     if not run_name.strip():
         yield (
             "```text\nNo board yet.\n```",
             "Name the run before starting.",
             "Status: not started",
+            "",
             None,
             None,
             None,
@@ -1161,6 +1270,7 @@ def run_experiment_live(
             "```text\nNo board yet.\n```",
             f"Missing dependency: {exc}",
             "Status: dependency error",
+            "",
             None,
             None,
             None,
@@ -1195,6 +1305,7 @@ def run_experiment_live(
             "```text\nNo board yet.\n```",
             key_shape_warning,
             "Status: API key/provider mismatch",
+            "",
             None,
             None,
             None,
@@ -1209,6 +1320,7 @@ def run_experiment_live(
             "```text\nNo board yet.\n```",
             missing_key_message,
             "Status: missing API key",
+            "",
             None,
             None,
             None,
@@ -1271,6 +1383,7 @@ def run_experiment_live(
                 "```text\nNo board yet.\n```",
                 "\n".join(transcript),
                 "Status: preflight failed",
+                "",
                 csv_path,
                 json_path,
                 None,
@@ -1306,6 +1419,7 @@ def run_experiment_live(
             last_board,
             "\n".join(transcript),
             _status_text(episode, num_episodes, turn, rewards, False),
+            "",
             None,
             None,
             None,
@@ -1392,6 +1506,7 @@ def run_experiment_live(
                         last_board,
                         "\n".join(transcript),
                         f"Status: action generation error\n{error_message}",
+                        _format_reasoning_traces_from_moves(move_records),
                         csv_path,
                         json_path,
                         None,
@@ -1492,6 +1607,7 @@ def run_experiment_live(
                     last_board,
                     "\n".join(transcript),
                     f"Status: environment step error\n{error_message}",
+                    _format_reasoning_traces_from_moves(move_records),
                     csv_path,
                     json_path,
                     None,
@@ -1507,6 +1623,7 @@ def run_experiment_live(
                 last_board,
                 "\n".join(transcript),
                 _status_text(episode, num_episodes, turn, rewards, terminated or truncated),
+                "",
                 None,
                 None,
                 None,
@@ -1542,7 +1659,21 @@ def run_experiment_live(
                 "run_id": run_id,
             })
 
+    sqlite_move_records, sqlite_result_records = _collect_sqlite_run_records(
+        run_name,
+        loggers,
+    )
+    if sqlite_move_records:
+        move_records = sqlite_move_records
+    if sqlite_result_records:
+        result_records = sqlite_result_records
+
     metadata["completed_at"] = datetime.utcnow().isoformat()
+    metadata["export_source"] = (
+        "SQLiteLogger moves/game_results tables"
+        if sqlite_move_records or sqlite_result_records
+        else "in-memory fallback"
+    )
     csv_path, json_path = _write_exports(
         run_name,
         metadata,
@@ -1550,6 +1681,7 @@ def run_experiment_live(
         result_records,
         failure_records,
     )
+    reasoning_traces = _format_reasoning_traces_from_moves(move_records)
     reward_fig, outcome_fig, turns_fig = _make_charts(result_records, move_records)
     transcript.append("\n## Outputs")
     transcript.append(f"- CSV: `{csv_path}`")
@@ -1559,6 +1691,7 @@ def run_experiment_live(
         last_board,
         "\n".join(transcript),
         _status_text(num_episodes, num_episodes, 0, {}, True),
+        reasoning_traces,
         csv_path,
         json_path,
         reward_fig,
@@ -1650,6 +1783,10 @@ def build_app() -> Any:
                     "Reasoning traces and episode logs will appear here.",
                     elem_classes=["gra-panel", "gra-log"],
                 )
+                reasoning_traces = gr.Markdown(
+                    "SQLite reasoning traces will appear here after the run.",
+                    elem_classes=["gra-panel", "gra-log"],
+                )
 
                 with gr.Row():
                     csv_file = gr.File(label="Download CSV")
@@ -1704,6 +1841,7 @@ def build_app() -> Any:
                 board,
                 transcript,
                 status,
+                reasoning_traces,
                 csv_file,
                 json_file,
                 reward_plot,
